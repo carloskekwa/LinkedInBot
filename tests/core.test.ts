@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pino, type Logger } from 'pino';
 import { loadConfig } from '../src/config.js';
-import { Bot, incomingBatch } from '../src/runtime.js';
+import { Bot, incomingBatch, recheckDelayMs } from '../src/runtime.js';
 import { Store } from '../src/storage.js';
 import { FakeAdapter, syntheticMessage } from '../src/demo.js';
 import { hash, messageId, parseReceipt, unknownReceipt } from '../src/time.js';
@@ -246,9 +246,144 @@ describe('action orchestration', () => {
   it('reconciles a timeout after successful delivery without resending', async () => {
     const s = setup(); s.fake.throwAfterSend = true; await reply(s);
     expect(s.store.all()[0]?.status).toBe('uncertain');
+    expect(s.store.all()[0]?.handledAt).not.toBeNull();
     await s.bot.messageTick();
     expect(s.store.all()[0]?.status).toBe('confirmed');
     expect(s.fake.sent).toHaveLength(1);
+  });
+  it('marks a send that failed before the click as failed, not uncertain, and retries after a pause', async () => {
+    const s = setup(); s.fake.failSendBeforeClick = true; await reply(s);
+    expect(s.store.all()[0]).toMatchObject({ status: 'failed', handledAt: null });
+    expect(s.store.unresolved('t')).toHaveLength(0);
+    expect(s.fake.sent).toHaveLength(0);
+    // Paused: no new draft is generated or typed on every poll.
+    const generated = s.generate.mock.calls.length;
+    for (let i = 0; i < 4; i++) { s.advance(); await s.bot.messageTick(); }
+    expect(s.generate.mock.calls.length).toBe(generated);
+    s.fake.failSendBeforeClick = false;
+    s.advance(130_000); await reply(s);
+    expect(s.fake.sent).toHaveLength(1);
+    expect(s.store.all().map(a => a.status)).toEqual(['failed', 'confirmed']);
+    expect(s.store.all()[1]?.key).toContain(':retry1');
+  });
+  it('gives up after repeated failures before the click and leaves the chat to the owner', async () => {
+    const s = setup(); s.fake.failSendBeforeClick = true;
+    for (let i = 0; i < 4; i++) { await reply(s); s.advance(10 * 60_000); }
+    await reply(s);
+    expect(s.store.all().map(a => a.status)).toEqual(['failed', 'failed', 'failed']);
+    expect(s.generate).toHaveBeenCalledTimes(3);
+    expect(s.store.consumed('m1')).toBe(true);
+    s.fake.failSendBeforeClick = false;
+    s.advance(60 * 60_000); await reply(s);
+    expect(s.fake.sent).toHaveLength(0);
+  });
+  it('escalates an HTTP rejection that happens before the click', async () => {
+    const s = setup(); s.fake.failSendBeforeClick = true;
+    s.fake.sendBeforeClickError = new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://example.invalid/');
+    await s.bot.messageTick(); s.advance();
+    await expect(s.bot.messageTick()).rejects.toThrow('ERR_HTTP_RESPONSE_CODE_FAILURE');
+    expect(s.store.all()[0]?.status).toBe('failed');
+  });
+  it('frees a chat blocked by an action that never reached the click', async () => {
+    const s = setup();
+    const stuck = s.store.create({ kind: 'reply', ref: 't', key: 'reply:t:old', textHash: hash('old'),
+      incomingIds: ['m1'], timing: { receivedAt: null, lastReceivedAt: null, detectedAt: 10,
+        precision: 'unknown', uncertaintyMs: null } });
+    s.store.transition(stuck, 'executing', 11);
+    s.store.transition(stuck, 'uncertain', 12);
+    await reply(s);
+    expect(s.store.all()[0]?.status).toBe('failed');
+    expect(s.fake.sent).toHaveLength(1);
+  });
+  it('keeps blocking an action whose click was dispatched', async () => {
+    const s = setup();
+    const clicked = s.store.create({ kind: 'reply', ref: 't', key: 'reply:t:old', textHash: hash('old'),
+      incomingIds: ['m1'], timing: { receivedAt: null, lastReceivedAt: null, detectedAt: 10,
+        precision: 'unknown', uncertaintyMs: null } });
+    s.store.transition(clicked, 'executing', 11);
+    clicked.handledAt = 12; s.store.save(clicked);
+    s.store.transition(clicked, 'uncertain', 13);
+    await reply(s);
+    expect(s.store.all()[0]?.status).toBe('uncertain');
+    expect(s.fake.sent).toHaveLength(0);
+  });
+  it('re-checks an uncertain invitation rarely, with growing pauses', async () => {
+    const s = setup(); s.fake.uncertainAccept = true;
+    s.fake.pending.push({ id: 'p', receipt: unknownReceipt() });
+    const verify = vi.spyOn(s.fake, 'verifyAcceptance');
+    await s.bot.invitationTick();
+    expect(verify).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 5; i++) { s.advance(20_000); await s.bot.invitationTick(); }
+    expect(verify).toHaveBeenCalledTimes(1);
+    s.advance(300_000); await s.bot.invitationTick();
+    expect(verify).toHaveBeenCalledTimes(2);
+    s.advance(300_000); await s.bot.invitationTick();
+    expect(verify).toHaveBeenCalledTimes(2);
+    s.advance(300_000); await s.bot.invitationTick();
+    expect(verify).toHaveBeenCalledTimes(3);
+    expect(s.fake.accepted.size).toBe(1);
+  });
+  it('does not check an uncertain invitation on startup, only after its first delay', async () => {
+    const s = setup();
+    const old = s.store.create({ kind: 'invitation', ref: 'p', key: 'invitation:p', textHash: null,
+      incomingIds: ['inv:p'], timing: { receivedAt: null, lastReceivedAt: null, detectedAt: 10,
+        precision: 'unknown', uncertaintyMs: null } });
+    s.store.transition(old, 'executing', 11);
+    old.handledAt = 12; s.store.save(old);
+    s.store.transition(old, 'uncertain', 13);
+    const verify = vi.spyOn(s.fake, 'verifyAcceptance');
+    await s.bot.invitationTick();
+    s.advance(20_000); await s.bot.invitationTick();
+    expect(verify).not.toHaveBeenCalled();
+    s.advance(300_000); await s.bot.invitationTick();
+    expect(verify).toHaveBeenCalledTimes(1);
+  });
+  it('contains a failed re-check, and escalates only an HTTP rejection', async () => {
+    const s = setup(); s.fake.uncertainAccept = true;
+    s.fake.pending.push({ id: 'p', receipt: unknownReceipt() });
+    const verify = vi.spyOn(s.fake, 'verifyAcceptance');
+    await s.bot.invitationTick();
+    s.fake.verifyAcceptanceError = new Error('Synthetic profile page failure');
+    s.advance(300_000);
+    await expect(s.bot.invitationTick()).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledTimes(2);
+    s.fake.verifyAcceptanceError = new Error('page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE');
+    s.advance(600_000);
+    await expect(s.bot.invitationTick()).rejects.toThrow('ERR_HTTP_RESPONSE_CODE_FAILURE');
+    expect(verify).toHaveBeenCalledTimes(3);
+    // The failed check is deferred, so the next tick does not load another page.
+    await expect(s.bot.invitationTick()).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledTimes(3);
+  });
+  it('retries an invitation whose Accept could not be clicked, then stops after three failures', async () => {
+    const s = setup(); s.fake.failAcceptBeforeClick = true;
+    s.fake.pending.push({ id: 'p', receipt: unknownReceipt() });
+    const accept = vi.spyOn(s.fake, 'accept');
+    await s.bot.invitationTick();
+    expect(s.store.all()[0]).toMatchObject({ status: 'failed', handledAt: null });
+    await s.bot.invitationTick();
+    expect(accept).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 6; i++) { s.advance(10 * 60_000); await s.bot.invitationTick(); }
+    expect(accept).toHaveBeenCalledTimes(3);
+    expect(s.store.all().map(a => a.status)).toEqual(['failed', 'failed', 'failed']);
+    s.fake.failAcceptBeforeClick = false;
+    s.advance(10 * 60_000); await s.bot.invitationTick();
+    expect(accept).toHaveBeenCalledTimes(3);
+  });
+  it('accepts an invitation on a later try after a failure before the click', async () => {
+    const s = setup(); s.fake.failAcceptBeforeClick = true;
+    s.fake.pending.push({ id: 'p', receipt: unknownReceipt() });
+    await s.bot.invitationTick();
+    s.fake.failAcceptBeforeClick = false;
+    s.advance(130_000); await s.bot.invitationTick();
+    expect(s.fake.accepted.size).toBe(1);
+    expect(s.store.all().map(a => a.status)).toEqual(['failed', 'confirmed']);
+  });
+  it('spaces re-checks by action kind', () => {
+    expect([1, 2, 3, 4, 5].map(n => recheckDelayMs('reply', n))).toEqual([0, 15_000, 60_000, 300_000, 600_000]);
+    expect([1, 2, 3, 4, 5].map(n => recheckDelayMs('invitation', n)))
+      .toEqual([300_000, 600_000, 1_200_000, 2_400_000, 3_600_000]);
+    expect(recheckDelayMs('invitation', 30)).toBe(3_600_000);
   });
   it('never confirms an earlier identical reply before the incoming anchor', async () => {
     const s = setup();

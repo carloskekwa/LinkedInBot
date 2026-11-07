@@ -5,11 +5,23 @@ import type { Config } from './config.js';
 import { Store } from './storage.js';
 import { backoffMs, isHttpRejection, safeDetail } from './errors.js';
 import { hash, timing } from './time.js';
-import type { Action, LinkedInPort, Message, ReplyGenerator, Thread } from './types.js';
+import type { Action, LinkedInPort, Message, ReplyGenerator, Thread, Verification } from './types.js';
 
 // A thread that errors is left alone this long, so one broken thread cannot cause
 // repeated page loads against LinkedIn.
 const THREAD_COOLDOWN_MS = 120_000;
+// A failure before the click changed nothing on LinkedIn, so the action may be retried a few
+// times, pausing twice as long after each failure.
+const MAX_PRECLICK_RETRIES = 3;
+const RETRY_BASE_MS = 120_000;
+const MAX_RECHECK_MS = 3_600_000;
+// Delays before re-checking an uncertain outcome. Re-checking an invitation loads a profile
+// page, which LinkedIn throttles, so it is done rarely; a reply check only reads the chat.
+export function recheckDelayMs(kind: Action['kind'], tries: number): number {
+  const steps = kind === 'reply' ? [0, 15_000, 60_000, 300_000] : [300_000, 600_000, 1_200_000];
+  if (tries <= steps.length) return steps[tries - 1]!;
+  return Math.min(MAX_RECHECK_MS, steps.at(-1)! * 2 ** (tries - steps.length));
+}
 interface Batch { first: number; lastChange: number; signature: string }
 export function incomingBatch(thread: Thread, store: Pick<Store, 'consumed'>): Message[] {
   if (!thread.supported || thread.messages.at(-1)?.own !== false) return [];
@@ -20,6 +32,10 @@ export function incomingBatch(thread: Thread, store: Pick<Store, 'consumed'>): M
 export class Bot {
   private readonly batches = new Map<string, Batch>();
   private readonly quarantine = new Map<string, number>();
+  // In memory only: a restart re-checks every uncertain action once.
+  private readonly rechecks = new Map<string, { tries: number; at: number }>();
+  private readonly invitationRetryAt = new Map<string, number>();
+  private readonly gaveUp = new Set<string>();
   private lastHealthLog = 0;
   private lastPrune = 0;
   private initialThreads: Set<string> | undefined;
@@ -59,16 +75,62 @@ export class Bot {
       llmMs: action.llmMs, debounceMs: action.debounceMs,
     }, 'Action confirmed');
   }
+  // The next check of an uncertain action is pushed back further each time.
+  private deferRecheck(action: Action): void {
+    const tries = (this.rechecks.get(action.id)?.tries ?? 0) + 1;
+    this.rechecks.set(action.id, { tries, at: this.now() + recheckDelayMs(action.kind, tries) });
+  }
+  // The key for the next attempt at an action. A failed attempt that never reached the click
+  // left nothing on LinkedIn, so it can be retried under a new key. Any other earlier attempt
+  // (confirmed, uncertain, clicked) blocks a new one.
+  private nextKey(base: string): { key: string; retries: number } | null {
+    for (let retries = 0; ; retries++) {
+      const key = retries ? `${base}:retry${retries}` : base;
+      const existing = this.store.forKey(key);
+      if (!existing) return { key, retries };
+      if (existing.status !== 'failed' || existing.handledAt !== null) return null;
+    }
+  }
   async reconcile(kind: Action['kind']): Promise<void> {
     for (const action of this.store.unresolved().filter(a => a.kind === kind)) {
       this.checkStop();
-      const result = action.kind === 'reply' && action.textHash
-        ? await this.port.verifySend(action.ref, action.textHash, action.incomingIds.at(-1)!)
-        : await this.port.verifyAcceptance(action.ref);
+      // It began executing but never reached the click, so nothing happened on LinkedIn and a
+      // retry is safe. This also frees a chat blocked by an earlier version of this check.
+      if (action.attempts > 0 && action.handledAt === null) {
+        this.store.transition(action, 'failed', this.now());
+        this.log.warn({ actionId: action.id, kind },
+          'Action never reached the click; marked failed so it can be retried safely');
+        continue;
+      }
+      if ((this.rechecks.get(action.id)?.at ?? 0) > this.now()) continue;
+      // After a restart there is no schedule. A reply check only reads the chat, but an
+      // invitation check loads a profile page right after startup's own page loads, which
+      // LinkedIn answered with HTTP errors. It waits for its first delay instead.
+      if (action.kind === 'invitation' && !this.rechecks.has(action.id)) {
+        this.deferRecheck(action);
+        continue;
+      }
+      let result: Verification;
+      try {
+        result = action.kind === 'reply' && action.textHash
+          ? await this.port.verifySend(action.ref, action.textHash, action.incomingIds.at(-1)!)
+          : await this.port.verifyAcceptance(action.ref);
+      } catch (error) {
+        if (this.signal.aborted) throw error;
+        this.deferRecheck(action);
+        this.log.warn({ actionId: action.id, errorType: error instanceof Error ? error.name : 'unknown',
+          detail: safeDetail(error) }, 'Reconciliation check failed; will check again later');
+        // Systemic: let the worker back off instead of checking the next action.
+        if (isHttpRejection(error)) throw error;
+        continue;
+      }
       this.store.transition(action, result === 'confirmed' ? 'confirmed' : 'uncertain', this.now());
       if (result === 'confirmed') this.logConfirmation(action);
-      else this.log.warn({ actionId: action.id, ref: hash(action.ref) },
-        'Outcome uncertain; no resend/re-click. This item remains blocked for manual review');
+      else {
+        this.deferRecheck(action);
+        this.log.warn({ actionId: action.id, ref: hash(action.ref) },
+          'Outcome uncertain; no resend/re-click. This item remains blocked for manual review');
+      }
     }
   }
   private dispatch(action: Action): () => void {
@@ -85,15 +147,24 @@ export class Bot {
     for (const inv of invitations) {
       this.checkStop();
       const observed = this.store.observe(`inv:${inv.id}`, inv.id, inv.receipt, this.now());
-      const key = `invitation:${inv.id}`;
-      if (this.store.forKey(key)) continue;
+      const next = this.nextKey(`invitation:${inv.id}`);
+      if (!next) continue;
       if (!this.live) {
         this.log.info({ ref: hash(inv.id), receivedAt: observed.receipt.at }, 'Dry-run: would accept');
         continue;
       }
+      if ((this.invitationRetryAt.get(inv.id) ?? 0) > this.now()) continue;
+      if (next.retries >= MAX_PRECLICK_RETRIES) {
+        if (!this.gaveUp.has(inv.id)) {
+          this.gaveUp.add(inv.id);
+          this.log.error({ ref: hash(inv.id), attempts: next.retries },
+            'Gave up accepting this invitation after repeated failures before clicking; accept it manually');
+        }
+        continue;
+      }
       if (!this.canAct()) break;
       const action = this.store.create({
-        kind: 'invitation', ref: inv.id, key, incomingIds: [`inv:${inv.id}`], textHash: null,
+        kind: 'invitation', ref: inv.id, key: next.key, incomingIds: [`inv:${inv.id}`], textHash: null,
         timing: { receivedAt: observed.receipt.at, lastReceivedAt: observed.receipt.at,
           precision: observed.receipt.precision, uncertaintyMs: observed.receipt.uncertaintyMs,
           detectedAt: observed.detectedAt },
@@ -104,12 +175,27 @@ export class Bot {
         const result = await this.port.verifyAcceptance(inv.id);
         this.store.transition(action, result === 'confirmed' ? 'confirmed' : 'uncertain', this.now());
         if (result === 'confirmed') this.logConfirmation(action);
-        else this.log.warn({ actionId: action.id }, 'Acceptance uncertain; will reconcile without clicking again');
+        else {
+          this.deferRecheck(action);
+          this.log.warn({ actionId: action.id }, 'Acceptance uncertain; will reconcile without clicking again');
+        }
       } catch (error) {
-        this.store.transition(action, 'uncertain', this.now());
-        this.log.error({ actionId: action.id, errorType: error instanceof Error ? error.name : 'unknown' },
-          'Acceptance failed or outcome uncertain; paused this invitation');
+        // handledAt is only set right before the click, so null means nothing was clicked.
+        const beforeClick = action.handledAt === null;
+        this.store.transition(action, beforeClick ? 'failed' : 'uncertain', this.now());
+        const errorType = error instanceof Error ? error.name : 'unknown';
+        if (beforeClick) {
+          this.invitationRetryAt.set(inv.id, this.now() + RETRY_BASE_MS * 2 ** next.retries);
+          this.log.error({ actionId: action.id, errorType, detail: safeDetail(error),
+            attempt: next.retries + 1, maxAttempts: MAX_PRECLICK_RETRIES },
+          'Acceptance failed before clicking Accept; nothing was changed. Will retry after a pause');
+        } else {
+          this.deferRecheck(action);
+          this.log.error({ actionId: action.id, errorType, detail: safeDetail(error) },
+            'Acceptance failed or outcome uncertain; paused this invitation');
+        }
         if (this.signal.aborted) throw error;
+        if (beforeClick && isHttpRejection(error)) throw error;
       }
     }
   }
@@ -168,6 +254,16 @@ export class Bot {
     if (this.now() - batch.lastChange < this.config.DEBOUNCE_MS &&
         this.now() - batch.first < this.config.MAX_DEBOUNCE_MS) return;
     if (this.live && !this.canAct()) return;
+    const next = this.live ? this.nextKey(`reply:${id}:${signature}`) : { key: '', retries: 0 };
+    if (!next) { this.batches.delete(id); return; }
+    if (next.retries >= MAX_PRECLICK_RETRIES) {
+      // Nothing was sent. Stop retrying so the chat is not typed into forever; the owner can answer.
+      this.store.consume(incoming.map(m => m.id));
+      this.batches.delete(id);
+      this.log.error({ ref: hash(id), attempts: next.retries },
+        'Gave up replying after repeated failures before sending; reply to this chat manually');
+      return;
+    }
 
     const start = performance.now();
     let reply;
@@ -226,7 +322,7 @@ export class Bot {
     if (!this.canAct() || !await this.port.authenticated()) return;
     const first = this.store.observe(incoming[0]!.id, id, incoming[0]!.receipt, this.now());
     const action = this.store.create({
-      kind: 'reply', ref: id, key: `reply:${id}:${signature}`,
+      kind: 'reply', ref: id, key: next.key,
       incomingIds: incoming.map(m => m.id), textHash: hash(reply.reply),
       timing: timing(incoming, first.detectedAt),
       generatedAt, llmMs, debounceMs: Math.max(0, generatedAt - batch.first - llmMs),
@@ -237,12 +333,28 @@ export class Bot {
       const result = await this.port.verifySend(id, hash(reply.reply), incoming.at(-1)!.id);
       this.store.transition(action, result === 'confirmed' ? 'confirmed' : 'uncertain', this.now());
       if (result === 'confirmed') this.logConfirmation(action);
-      else this.log.warn({ actionId: action.id }, 'Send uncertain; no automatic retry');
+      else {
+        this.deferRecheck(action);
+        this.log.warn({ actionId: action.id }, 'Send uncertain; no automatic retry');
+      }
     } catch (error) {
-      this.store.transition(action, 'uncertain', this.now());
-      this.log.error({ actionId: action.id, errorType: error instanceof Error ? error.name : 'unknown',
-        detail: safeDetail(error) }, 'Send failed or outcome uncertain; conversation blocked until reconciled');
+      // handledAt is only set right before the click, so null means nothing was sent.
+      const beforeClick = action.handledAt === null;
+      this.store.transition(action, beforeClick ? 'failed' : 'uncertain', this.now());
+      const errorType = error instanceof Error ? error.name : 'unknown';
+      if (beforeClick) {
+        this.quarantine.set(id, this.now() + RETRY_BASE_MS * 2 ** next.retries);
+        this.log.error({ actionId: action.id, errorType, detail: safeDetail(error),
+          attempt: next.retries + 1, maxAttempts: MAX_PRECLICK_RETRIES },
+        'Send failed before clicking Send; nothing was sent. Will retry after a pause');
+      } else {
+        this.deferRecheck(action);
+        this.log.error({ actionId: action.id, errorType, detail: safeDetail(error) },
+          'Send failed or outcome uncertain; conversation blocked until reconciled');
+      }
+      this.batches.delete(id);
       if (this.signal.aborted) throw error;
+      if (beforeClick && isHttpRejection(error)) throw error;
     }
     this.batches.delete(id);
   }

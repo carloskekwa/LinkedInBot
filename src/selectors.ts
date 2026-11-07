@@ -36,8 +36,10 @@ export const defaults = {
   recipient: '.msg-thread__link-to-profile',
   unsupported: '.msg-thread__group-conversation, .msg-thread__inmail',
   composer: '.msg-form__contenteditable[contenteditable="true"], [role="textbox"][contenteditable="true"]',
-  // The Send button is only rendered once the composer has content.
-  send: 'button.msg-form__send-button, form.msg-form button[type="submit"]:not(.msg-form__send-toggle)',
+  // LinkedIn renders Send at all times, disabled until the composer has text (confirmed live with
+  // `npm run probe:send`). Searched inside the composer's own form and only if visible: a bare
+  // type="submit" match could be another control.
+  send: 'button.msg-form__send-button',
   profileMore: 'button[aria-label="More actions"], button:has-text("More")',
   removeConnection: '[role="menuitem"]:has-text("Remove connection"), .artdeco-dropdown__item:has-text("Remove connection")',
 };

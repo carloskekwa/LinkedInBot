@@ -15,7 +15,8 @@ const completionSchema = z.object({
 const urls = (text: string): string[] => text.match(/https?:\/\/[^\s<>"']+/gi) ?? [];
 export function guardReply(value: unknown, context: Message[]): Reply {
   const parsed = replySchema.parse(value);
-  parsed.reply = parsed.reply.trim();
+  // One line: a line break would be typed as Enter, which can send the message early.
+  parsed.reply = parsed.reply.replace(/\s*[\r\n]+\s*/g, ' ').trim();
   const allowedUrls = new Set(context.flatMap(m => urls(m.text)));
   if (urls(parsed.reply).some(url => !allowedUrls.has(url))) {
     throw new Error('Generated reply introduced an untrusted URL');
@@ -37,7 +38,8 @@ const BOT_PHRASES = new RegExp([
   'i\'?ll do my best', 'i understand (?:it|you|that|how)', 'sorry to hear (?:you|that)',
   'i\'?m (?:happy|glad|delighted|thrilled) to (?:help|assist)', 'i can\'?t share (?:that|this)',
 ].join('|'), 'i');
-// Interest/commitment on the owner's behalf. Never acceptable, even on the final try.
+// Interest/commitment on the owner's behalf. Allowed only when the owner wrote that position in
+// the approved facts (see commitmentIssue); never otherwise, even on the final try.
 const COMMITMENT = new RegExp([
   '\\b(?:i\'?m|i am)\\s+(?:\\w+ly\\s+|always\\s+|also\\s+|just\\s+)?(?:interested|keen|open to)\\b',
   '\\b(?:i\'?m|i am)\\s+(?:\\w+ly\\s+|always\\s+|more than\\s+)?(?:happy|glad|delighted|thrilled|excited|eager|keen)\\s+to\\b',
@@ -144,6 +146,26 @@ export function ownerClaimIssue(reply: string, facts: string[]): string | null {
   }
   return null;
 }
+// Words that carry no content in a statement of interest ("I'd", "I'm", "would be").
+const COMMITMENT_STOP = new Set([...CLAIM_STOP, 'm', 'd', 'll', 've', 're', 's', 'would', 'will', 'can',
+  'could', 'about', 'more', 'once', 'after', 'that', 'this', 'its', 'yes', 'sure', 'definitely', 'really',
+  'always', 'also', 'just', 'very', 'quite', 'if', 'when', 'what', 'how', 'who', 'which', 'any']);
+// Returns the first sentence that commits the owner to something the approved facts do not state,
+// or null. A sentence passes only if it has at least two content words and the facts support all
+// of them, so "I'm open to new opportunities" passes when the owner wrote that, while "I'm
+// interested." or "I'd love to join your team" do not.
+export function commitmentIssue(reply: string, facts: string[]): string | null {
+  const factWords = wordsOf(facts.join(' '));
+  const supported = (word: string): boolean => factWords.some(f => f === word ||
+    (word.length >= 4 && f.length >= 4 && (f.startsWith(word) || word.startsWith(f))));
+  const text = reply.replace(/[\u2018\u2019]/g, '\'');
+  for (const sentence of text.split(/(?<=[.!?])\s+/)) {
+    if (!COMMITMENT.test(sentence)) continue;
+    const content = wordsOf(sentence).filter(w => !COMMITMENT_STOP.has(w));
+    if (content.length < 2 || content.some(w => !supported(w))) return sentence.trim();
+  }
+  return null;
+}
 export function reviewReply(reply: string, facts: string[] = []): ReplyIssue | null {
   const text = reply.replace(/[\u2018\u2019]/g, '\'');
   if (AUTOMATION_DENIAL.test(text)) {
@@ -151,9 +173,10 @@ export function reviewReply(reply: string, facts: string[] = []): ReplyIssue | n
       message: 'it denied being automated or claimed to be a person. This is an automated assistant: ' +
         'never deny that, and answer honestly if asked' };
   }
-  if (COMMITMENT.test(text)) {
-    return { rule: 'commitment', message: 'it expressed interest or a commitment on the owner\'s behalf', hard: true,
-      safeReply: SAFE_COMMITMENT };
+  if (commitmentIssue(reply, facts) !== null) {
+    return { rule: 'commitment', hard: true, safeReply: SAFE_COMMITMENT,
+      message: 'it expressed interest, availability or a commitment for the owner that the approved facts ' +
+        'do not state. Only state a position the facts give, in the facts\' own words; otherwise ask for details' };
   }
   if (ownerClaimIssue(reply, facts) !== null || PROFILE_CLAIM.test(text) || DENIAL.test(text)) {
     return { rule: 'owner-claim', message: 'it stated personal facts about the owner, or what their profile contains, that are ' +

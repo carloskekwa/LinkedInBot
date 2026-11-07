@@ -15,6 +15,11 @@ export class FakeAdapter implements LinkedInPort {
   uncertainSend = false;
   uncertainAccept = false;
   throwAfterSend = false;
+  // Fail before the click, like a Send button that never appears or cannot be clicked.
+  failSendBeforeClick = false;
+  sendBeforeClickError = new Error('Synthetic Send button not visible');
+  failAcceptBeforeClick = false;
+  verifyAcceptanceError: Error | null = null;
   closed = false;
   failingThreads = new Set<string>();
   stale = new Set<string>();
@@ -24,11 +29,13 @@ export class FakeAdapter implements LinkedInPort {
   async authenticated(): Promise<boolean> { return this.loggedIn; }
   async invitations(): Promise<Invitation[]> { return structuredClone(this.pending); }
   async accept(id: string, beforeClick: () => void): Promise<void> {
+    if (this.failAcceptBeforeClick) throw new Error('Synthetic Accept button not clickable');
     beforeClick();
     this.accepted.add(id);
     this.pending = this.pending.filter(i => i.id !== id);
   }
   async verifyAcceptance(id: string) {
+    if (this.verifyAcceptanceError) throw this.verifyAcceptanceError;
     return !this.uncertainAccept && this.accepted.has(id) ? 'confirmed' as const : 'uncertain' as const;
   }
   async conversations(): Promise<string[]> { return [...this.threads.keys()]; }
@@ -40,6 +47,7 @@ export class FakeAdapter implements LinkedInPort {
     return structuredClone(thread);
   }
   async send(id: string, text: string, beforeClick: () => void): Promise<void> {
+    if (this.failSendBeforeClick) throw this.sendBeforeClickError;
     beforeClick();
     this.sent.push({ id, text });
     this.threads.get(id)!.messages.push({

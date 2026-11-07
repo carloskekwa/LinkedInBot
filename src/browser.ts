@@ -48,6 +48,61 @@ export function looksOld(label: string): boolean {
 async function optionalText(locator: Locator): Promise<string> {
   return await locator.count() ? (await locator.first().innerText()).trim() : '';
 }
+// Typing speed: about one character per 20 ms, so a 300-character reply takes ~6 s.
+const TYPING_DELAY_MS = 20;
+// Contenteditable text mixes &nbsp; with spaces, so compare with whitespace normalised.
+const normalized = (text: string): string => text.replace(/[\s\u00a0]+/g, ' ').trim();
+
+// Structural facts about a control (class names and booleans, never text), for diagnosis.
+export interface ControlInfo {
+  tag: string; classes: string; type: string | null; ariaLabel: string;
+  visible: boolean; enabled: boolean; ariaHidden: string | null;
+  ariaExpanded: string | null; ariaChecked: string | null;
+}
+export interface SendProbe {
+  generatedAt: string; sendSelector: string; composerInForm: boolean;
+  controlsBefore: ControlInfo[]; controlsAfterTyping: ControlInfo[];
+  sendVisible: boolean; sendEnabled: boolean | null; sendClickable: boolean | null;
+  composerCleared: boolean;
+}
+async function sendControls(scope: Locator | Page): Promise<ControlInfo[]> {
+  return scope.locator('button, [role="button"]').evaluateAll(elements => elements.map(element => {
+    const style = getComputedStyle(element);
+    return {
+      tag: element.tagName.toLowerCase(),
+      classes: (typeof element.className === 'string' ? element.className : '')
+        .trim().split(/\s+/).slice(0, 4).join('.'),
+      type: element.getAttribute('type'),
+      ariaLabel: (element.getAttribute('aria-label') ?? '').slice(0, 40),
+      visible: element.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none',
+      enabled: !(element as HTMLButtonElement).disabled && element.getAttribute('aria-disabled') !== 'true',
+      ariaHidden: element.getAttribute('aria-hidden'),
+      ariaExpanded: element.getAttribute('aria-expanded'),
+      ariaChecked: element.getAttribute('aria-checked'),
+    };
+  }));
+}
+async function describeControls(scope: Locator | Page): Promise<string> {
+  try {
+    const controls = (await sendControls(scope)).slice(0, 8);
+    if (!controls.length) return 'no buttons found in the composer form';
+    return controls.map(c => `${c.classes || c.tag} visible=${c.visible} enabled=${c.enabled}`).join('; ');
+  } catch { return 'controls could not be read'; }
+}
+async function describeLocator(locator: Locator): Promise<string> {
+  try {
+    return `matches=${await locator.count()} visible=${await locator.isVisible()} enabled=${await locator.isEnabled()}`;
+  } catch { return 'state could not be read'; }
+}
+// Playwright's click log names what covers a target ("<div class="a b"> intercepts pointer
+// events"). Only the tag and class names are kept, never text or attributes.
+export function blockedBy(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  const match = /<([a-z][a-z0-9-]*)\b[^>]*?\bclass="([^"]{0,200})"[^>]*>[^\n]*?intercepts pointer events/i.exec(message);
+  if (!match) return /intercepts pointer events/i.test(message) ? ' covered by another element' : '';
+  const classes = match[2]!.trim().split(/\s+/).slice(0, 3).join('.');
+  return ` covered by ${match[1]}${classes ? `.${classes}` : ''}`;
+}
 export class PlaywrightAdapter implements LinkedInPort {
   private owner = '';
   private readonly selectors: Selectors;
@@ -222,6 +277,13 @@ export class PlaywrightAdapter implements LinkedInPort {
       if (entry.id === id) {
         const accept = entry.card.locator(this.selectors.invitationAccept).first();
         await accept.waitFor();
+        // A trial click runs every actionability check without clicking, so a button that cannot
+        // be clicked fails here, before the click is recorded as dispatched.
+        try { await accept.click({ trial: true }); }
+        catch (error) {
+          throw new Error(`Accept button is not clickable (${await describeLocator(accept)}${blockedBy(error)})`,
+            { cause: error });
+        }
         beforeClick();
         await accept.click();
         return;
@@ -233,10 +295,14 @@ export class PlaywrightAdapter implements LinkedInPort {
     // Card disappearance alone cannot distinguish acceptance from withdrawal.
     await this.invitationsPage.goto(profileUrl(id), { waitUntil: 'domcontentloaded' });
     if (!await this.isAuthenticated(this.invitationsPage)) return 'uncertain';
-    const more = this.invitationsPage.locator(this.selectors.profileMore).first();
+    // Visible matches only: `button:has-text("More")` also matches hidden buttons elsewhere on
+    // the page, and clicking one of those times out.
+    const more = this.invitationsPage.locator(this.selectors.profileMore).filter({ visible: true }).first();
     if (!await more.count()) return 'uncertain';
     await more.click();
-    const connected = await this.invitationsPage.locator(this.selectors.removeConnection).first().isVisible();
+    // The menu renders a moment after the click, so wait briefly instead of checking once.
+    const connected = await this.invitationsPage.locator(this.selectors.removeConnection).first()
+      .waitFor({ state: 'visible', timeout: 3_000 }).then(() => true, () => false);
     await this.invitationsPage.keyboard.press('Escape');
     return connected ? 'confirmed' : 'uncertain';
   }
@@ -452,6 +518,14 @@ export class PlaywrightAdapter implements LinkedInPort {
     }
     return { id, messages, supported: true };
   }
+  // The composer's own form, so a button elsewhere on the page is never mistaken for Send.
+  private composerScope(composer: Locator): Locator {
+    return composer.locator('xpath=ancestor::form[1]');
+  }
+  private async scopeFor(composer: Locator): Promise<Locator | Page> {
+    const form = this.composerScope(composer);
+    return await form.count() ? form : this.messagesPage;
+  }
   async send(id: string, text: string, beforeClick: () => void): Promise<void> {
     await this.openConversation(id);
     if (!await this.authenticated()) throw new Error('Authentication required');
@@ -459,20 +533,76 @@ export class PlaywrightAdapter implements LinkedInPort {
     if ((await composer.innerText()).trim()) {
       throw new Error('Existing composer draft found; refusing to overwrite or send it');
     }
-    const send = this.messagesPage.locator(this.selectors.send).first();
+    const scope = await this.scopeFor(composer);
+    const send = scope.locator(this.selectors.send).filter({ visible: true }).first();
     try {
-      await composer.fill(text);
-      await send.waitFor({ timeout: 5_000 });
-      if (!await send.isEnabled()) throw new Error('Send button disabled');
+      // Real keystrokes, like a person typing: LinkedIn may only reveal Send for those.
+      await composer.click();
+      await composer.pressSequentially(text, { delay: TYPING_DELAY_MS, timeout: 30_000 });
+      if (normalized(await composer.innerText()) !== normalized(text)) {
+        throw new Error('Composer text does not match the reply; refusing to send');
+      }
+      try { await send.waitFor({ timeout: 5_000 }); }
+      catch (error) {
+        throw new Error(`Send button not visible after typing (${await describeControls(scope)})`,
+          { cause: error });
+      }
+      // LinkedIn renders Send at all times and enables it shortly after typing, so the
+      // click check (which waits for the button to be enabled) must come before any decision.
+      // It runs every actionability check without clicking, so only a real click attempt
+      // is recorded as dispatched.
+      try { await send.click({ trial: true, timeout: 5_000 }); }
+      catch (error) {
+        throw new Error(`Send button is not clickable (${await describeLocator(send)}${blockedBy(error)})`,
+          { cause: error });
+      }
       beforeClick();
-      await send.click();
+      await send.click({ timeout: 5_000 });
     } catch (error) {
-      // Clear only the bot's exact draft. Never clear user-authored edits.
-      if (!this.messagesPage.isClosed() && (await composer.innerText()).trim() === text.trim()) {
-        await composer.fill('');
+      // Clear only what the bot typed (all of it or a prefix). Never clear user-authored edits.
+      if (!this.messagesPage.isClosed()) {
+        const current = normalized(await composer.innerText());
+        if (current !== '' && normalized(text).startsWith(current)) await composer.fill('');
       }
       throw error;
     }
+  }
+  // Read-only diagnosis of the Send control: types one character, records which buttons the
+  // composer form shows, then removes it. It never clicks Send (trial clicks only run checks).
+  async probeSend(): Promise<SendProbe> {
+    if (!new URL(this.messagesPage.url()).pathname.startsWith('/messaging/thread/')) {
+      throw new Error('No conversation is open: open one in the browser first');
+    }
+    const composer = this.messagesPage.locator(this.selectors.composer).first();
+    if (!await composer.count()) throw new Error('Composer not found with the composer selector');
+    if ((await composer.innerText()).trim()) {
+      throw new Error('The composer already contains text; clear it first. The probe never overwrites a draft');
+    }
+    const scope = await this.scopeFor(composer);
+    const send = scope.locator(this.selectors.send).filter({ visible: true }).first();
+    const probe: SendProbe = {
+      generatedAt: new Date().toISOString(), sendSelector: this.selectors.send,
+      composerInForm: await this.composerScope(composer).count() > 0,
+      controlsBefore: await sendControls(scope), controlsAfterTyping: [],
+      sendVisible: false, sendEnabled: null, sendClickable: null, composerCleared: false,
+    };
+    try {
+      await composer.click();
+      await composer.pressSequentially('.', { delay: TYPING_DELAY_MS, timeout: 10_000 });
+      await delay(1_500);
+      probe.controlsAfterTyping = await sendControls(scope);
+      probe.sendVisible = await send.waitFor({ timeout: 5_000 }).then(() => true, () => false);
+      if (probe.sendVisible) {
+        probe.sendEnabled = await send.isEnabled();
+        probe.sendClickable = await send.click({ trial: true, timeout: 5_000 }).then(() => true, () => false);
+      }
+    } finally {
+      try {
+        if (normalized(await composer.innerText()) === '.') await composer.fill('');
+        probe.composerCleared = (await composer.innerText()).trim() === '';
+      } catch { /* page closed: the result below still reports composerCleared=false */ }
+    }
+    return probe;
   }
   async verifySend(id: string, textHash: string, afterMessageId: string): Promise<Verification> {
     for (let attempt = 0; attempt < 3; attempt++) {

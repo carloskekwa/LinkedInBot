@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, chmodSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { createInterface } from 'node:readline/promises';
 import { pino } from 'pino';
 import { loadConfig, loadOwnerFacts, loadPrompt } from './config.js';
 import { PlaywrightAdapter } from './browser.js';
@@ -22,10 +23,10 @@ async function main(): Promise<void> {
   if (existsSync('.env')) process.loadEnvFile('.env');
   const args = process.argv.slice(2);
   if (args.includes('--help')) {
-    console.log('Usage: npm start -- [--dry-run | --live | --login | --smoke | --inspect | --demo | --report]');
+    console.log('Usage: npm start -- [--dry-run | --live | --login | --smoke | --inspect | --probe-send | --demo | --report]');
     return;
   }
-  const valid = ['--dry-run', '--live', '--login', '--smoke', '--inspect', '--demo', '--report'];
+  const valid = ['--dry-run', '--live', '--login', '--smoke', '--inspect', '--probe-send', '--demo', '--report'];
   if (args.length > 1 || args.some(arg => !valid.includes(arg))) {
     throw new Error('Choose exactly one documented CLI mode; use --help');
   }
@@ -51,7 +52,7 @@ async function main(): Promise<void> {
   if (live && !config.ACKNOWLEDGE_PLATFORM_RISK) {
     throw new Error('Live mode requires ACKNOWLEDGE_PLATFORM_RISK=true; read README first');
   }
-  const needsAi = !['--login', '--smoke', '--inspect'].includes(args[0]!);
+  const needsAi = !['--login', '--smoke', '--inspect', '--probe-send'].includes(args[0]!);
   const owner = needsAi ? loadOwnerFacts(config.OWNER_FACTS_FILE) : { facts: [], skipped: 0 };
   const generator = needsAi ? new LlmGenerator(config, loadPrompt(config), log, owner.facts) : undefined;
   if (generator) {
@@ -81,6 +82,23 @@ async function main(): Promise<void> {
       return;
     }
     await adapter.initialize();
+    if (args[0] === '--probe-send') {
+      console.log([
+        '', 'Send probe: types ONE character into a conversation, checks which buttons appear, removes it.',
+        'It never clicks Send. The other person may briefly see a typing indicator, so use a chat with',
+        'yourself or a friend who agreed. In the browser, open that conversation now.', '',
+      ].join('\n'));
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try { await rl.question('Press Enter here once the conversation is open: ', { signal: controller.signal }); }
+      finally { rl.close(); }
+      const probe = await adapter.probeSend();
+      const file = join(dataDir, 'send-probe.json');
+      writeFileSync(file, JSON.stringify(probe, null, 2), { mode: 0o600 });
+      console.log(JSON.stringify({ sendVisible: probe.sendVisible, sendEnabled: probe.sendEnabled,
+        sendClickable: probe.sendClickable, composerInForm: probe.composerInForm,
+        composerCleared: probe.composerCleared, report: file }, null, 2));
+      return;
+    }
     if (args[0] === '--smoke') {
       const invitations = await adapter.invitations();
       const threads = await adapter.conversations();

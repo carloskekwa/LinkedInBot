@@ -15,6 +15,7 @@
     "login": "node dist/index.js --login",
     "smoke:live": "node dist/index.js --smoke",
     "inspect:live": "node dist/index.js --inspect",
+    "probe:send": "node dist/index.js --probe-send",
     "demo": "node dist/index.js --demo",
     "report": "node dist/index.js --report"
   },

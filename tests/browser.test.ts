@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { chromium, type Browser } from 'playwright';
 import { pino } from 'pino';
-import { PlaywrightAdapter, jittered, looksOld, profileUrl } from '../src/browser.js';
+import { PlaywrightAdapter, blockedBy, jittered, looksOld, profileUrl } from '../src/browser.js';
 import { loadConfig } from '../src/config.js';
 import { hash } from '../src/time.js';
 
@@ -365,9 +365,140 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
         document.querySelector('[contenteditable]')!.removeAttribute('oninput');
       });
       await expect(port.send(id, 'Bot reply', () => { throw new Error('must not dispatch'); }))
-        .rejects.toThrow(/Timeout|waitFor/);
+        .rejects.toThrow(/Send button not visible after typing \(msg-form__send-toggle visible=true/);
       expect((await messages.locator('[contenteditable]').innerText()).trim()).toBe('');
     } finally { await port.close(); }
+  });
+  it('sends only through the composer form\'s visible Send button, never another one on the page', async () => {
+    const html = fixture.replace('<form class="msg-form">',
+      '<form class="other"><button type="submit" class="msg-form__send-button" ' +
+      'onclick="window.__wrong = true; return false">Wrong</button></form><form class="msg-form">');
+    const { port, messages } = await adapter('', html);
+    try {
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      await port.send(id, 'Right button', () => {});
+      expect(await messages.evaluate(() => (window as unknown as Record<string, unknown>)['__wrong'])).toBeUndefined();
+      expect(await messages.locator('[data-event-urn="urn:synthetic:own"]').innerText()).toContain('Right button');
+    } finally { await port.close(); }
+  });
+  it('types with real keystrokes, so a Send button revealed only by key events appears', async () => {
+    const html = fixture.replace('oninput="toggleSend()"', 'onkeyup="toggleSend()"');
+    const { port, messages } = await adapter('', html);
+    try {
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      await port.send(id, 'Typed reply', () => {});
+      expect(await messages.locator('[data-event-urn="urn:synthetic:own"]').innerText()).toContain('Typed reply');
+    } finally { await port.close(); }
+  });
+  it('fails before dispatch when Send is covered, naming what covers it', async () => {
+    const html = fixture.replace('form.append(button);', 'form.append(button);' +
+      'const o = document.createElement("div"); o.className = "overlay";' +
+      'o.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:9999";' +
+      'document.body.append(o);');
+    const { port, messages } = await adapter('', html);
+    try {
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      let dispatched = false;
+      await expect(port.send(id, 'Covered', () => { dispatched = true; }))
+        .rejects.toThrow(/Send button is not clickable \(.*covered by div\.overlay\)/);
+      expect(dispatched).toBe(false);
+      expect(await messages.locator('[data-event-urn="urn:synthetic:own"]').count()).toBe(0);
+      expect((await messages.locator('[contenteditable]').innerText()).trim()).toBe('');
+    } finally { await port.close(); }
+  });
+  it('fails before dispatch when the Accept button cannot be clicked', async () => {
+    const html = fixture.replace('<main>', '<div class="overlay" ' +
+      'style="position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:9999"></div><main>');
+    const { port, invitations } = await adapter('', html);
+    try {
+      invitations.context().setDefaultTimeout(1_500);
+      let dispatched = false;
+      await expect(port.accept('https://www.linkedin.com/in/synthetic-contact/', () => { dispatched = true; }))
+        .rejects.toThrow(/Accept button is not clickable \(.*covered by div\.overlay\)/);
+      expect(dispatched).toBe(false);
+    } finally { await port.close(); }
+  });
+  it('waits for a Send button that is always visible but enables only after typing', async () => {
+    // Like the live UI (probe:send): rendered at once, disabled while empty, enabled shortly after input.
+    const html = fixture.replace('<button type="button" class="msg-form__send-toggle">Mode</button>',
+      '<button type="submit" class="msg-form__send-button" disabled onclick="event.preventDefault(); sendSynthetic()">Send</button>' +
+      '<button type="button" class="msg-form__send-toggle">Mode</button>')
+      .replace('function toggleSend() {', 'function toggleSend() {' +
+        'const live = document.querySelector(".msg-form__send-button");' +
+        'const filled = document.querySelector("[contenteditable]").textContent.trim().length > 0;' +
+        'clearTimeout(window.__enable);' +
+        'if (live) { if (filled) window.__enable = setTimeout(() => { live.disabled = false; }, 600); else live.disabled = true; return; }');
+    const { port, messages } = await adapter('', html);
+    try {
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      await port.send(id, 'Patient reply', () => {});
+      expect(await messages.locator('[data-event-urn="urn:synthetic:own"]').innerText()).toContain('Patient reply');
+    } finally { await port.close(); }
+  });
+  it('fails before dispatch when Send never becomes enabled', async () => {
+    const html = fixture.replace('<button type="button" class="msg-form__send-toggle">Mode</button>',
+      '<button type="submit" class="msg-form__send-button" disabled>Send</button>' +
+      '<button type="button" class="msg-form__send-toggle">Mode</button>')
+      .replace('function toggleSend() {', 'function toggleSend() { if (document.querySelector(".msg-form__send-button")) return;');
+    const { port, messages } = await adapter('', html);
+    try {
+      messages.context().setDefaultTimeout(1_500);
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      let dispatched = false;
+      await expect(port.send(id, 'Never enabled', () => { dispatched = true; }))
+        .rejects.toThrow(/Send button is not clickable \(matches=1 visible=true enabled=false/);
+      expect(dispatched).toBe(false);
+      expect((await messages.locator('[contenteditable]').innerText()).trim()).toBe('');
+    } finally { await port.close(); }
+  });
+  it('probes the Send control without sending, and removes its character', async () => {
+    const { port, messages } = await adapter();
+    try {
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      const probe = await port.probeSend();
+      expect(probe).toMatchObject({ composerInForm: true, sendVisible: true, sendEnabled: true,
+        sendClickable: true, composerCleared: true });
+      expect(probe.controlsBefore.map(c => c.classes)).toEqual(['msg-form__send-toggle']);
+      expect(probe.controlsAfterTyping.find(c => c.classes === 'msg-form__send-button'))
+        .toMatchObject({ type: 'submit', visible: true, enabled: true });
+      expect(await messages.locator('[data-event-urn="urn:synthetic:own"]').count()).toBe(0);
+      expect(JSON.stringify(probe)).not.toContain('synthetic-contact');
+    } finally { await port.close(); }
+  });
+  it('probe reports a Send button that never appears, and still clears its character', async () => {
+    const { port, messages } = await adapter();
+    try {
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      await messages.evaluate(() => { document.querySelector('[contenteditable]')!.removeAttribute('oninput'); });
+      const probe = await port.probeSend();
+      expect(probe).toMatchObject({ sendVisible: false, sendEnabled: null, sendClickable: null,
+        composerCleared: true });
+    } finally { await port.close(); }
+  });
+  it('probe refuses without an open conversation or over an existing draft', async () => {
+    const { port, messages } = await adapter();
+    try {
+      await expect(port.probeSend()).rejects.toThrow('No conversation is open');
+      const id = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      await port.thread(id);
+      await messages.locator('[contenteditable]').fill('Owner draft');
+      await expect(port.probeSend()).rejects.toThrow('already contains text');
+      expect(await messages.locator('[contenteditable]').innerText()).toBe('Owner draft');
+    } finally { await port.close(); }
+  });
+  it('names only the tag and classes of the element covering a click', () => {
+    expect(blockedBy(new Error('locator.click: Timeout 5000ms exceeded.\nCall log:\n  - <div class="a b c d">Secret name</div> intercepts pointer events')))
+      .toBe(' covered by div.a.b.c');
+    expect(blockedBy(new Error('x\n  - <div>no class</div> intercepts pointer events'))).toBe(' covered by another element');
+    expect(blockedBy(new Error('plain timeout'))).toBe('');
+    expect(blockedBy('not an error')).toBe('');
   });
   it('does not overwrite or send an existing owner draft', async () => {
     const { port, messages } = await adapter();
@@ -387,6 +518,17 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
       await expect(port.send(id, 'Bot reply', () => { throw new Error('Stopped'); }))
         .rejects.toThrow('Stopped');
       expect((await messages.locator('[contenteditable]').innerText()).trim()).toBe('');
+    } finally { await port.close(); }
+  });
+  it('verifies acceptance through the visible "More" button and the menu that opens after a delay', async () => {
+    const { port, invitations } = await adapter();
+    try {
+      await invitations.route('**/in/**', route => route.fulfill({
+        contentType: 'text/html', body: `<nav class="global-nav"><a href="/messaging/">Messaging</a></nav>
+          <button hidden>More hidden</button>
+          <button aria-label="More actions" onclick="setTimeout(() => document.querySelector('[role=menuitem]').hidden = false, 400)">More</button>
+          <div role="menuitem" hidden>Remove connection</div>` }));
+      expect(await port.verifyAcceptance('https://www.linkedin.com/in/synthetic-contact/')).toBe('confirmed');
     } finally { await port.close(); }
   });
   it('cannot confirm an invitation merely because its card disappeared', async () => {

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pino } from 'pino';
 import { loadConfig, loadOwnerFacts, loadPrompt } from '../src/config.js';
-import { guardReply, LlmGenerator, reviewReply } from '../src/ai.js';
+import { guardReply, LlmGenerator, commitmentIssue, reviewReply } from '../src/ai.js';
 import { syntheticMessage } from '../src/demo.js';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -78,6 +78,10 @@ describe('configuration and LLM contract', () => {
     'not JSON',
   ])('rejects invalid or unsafe output %#', value => {
     expect(() => guardReply(value, [])).toThrow();
+  });
+  it('keeps a model reply on one line, since a line break would be typed as Enter', () => {
+    expect(guardReply({ ...valid, reply: 'First line.\n\n  Second line.\r\nThird.' }, []).reply)
+      .toBe('First line. Second line. Third.');
   });
   it('allows a URL already in context and honest disclosure', () => {
     expect(guardReply({ ...valid, reply: 'I am an automated assistant.' }, [])).toBeTruthy();
@@ -267,14 +271,45 @@ describe('configuration and LLM contract', () => {
       const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
       expect(retryBody.messages[0].content).toContain('denied having experience');
     });
-    it('never states openness from the facts: opportunity questions get a request for details', async () => {
+    it('states a position the owner wrote in the facts, and asks for the job description', async () => {
+      const facts = ['If asked about a new job or opportunity: I\'m open to new opportunities and would like to ' +
+        'start a process with the company once I know more about the job description.',
+      'If asked about salary: my expected salary range is 50k to 60k.'];
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(completion(draft(
+        'Yes, I\'m open to new opportunities. Could you share the job description?')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }), facts);
+      const reply = await withFacts.generate([syntheticMessage('m',
+        'I don\'t have any detail - just asking if you are open for a new job position in your career?')],
+      new AbortController().signal);
+      expect(reply.reply).toBe('Yes, I\'m open to new opportunities. Could you share the job description?');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // The salary line is a plain fact: stated when asked, in the facts' figures.
+      expect(reviewReply('My expected salary range is 50k to 60k.', facts)).toBeNull();
+      expect(reviewReply('I\'m open to new opportunities and would like to start a process once I know more ' +
+        'about the job description.', facts)).toBeNull();
+    });
+    it('still blocks positions the facts do not state, even when similar words appear in them', () => {
+      const facts = ['If asked about a new job or opportunity: I\'m open to new opportunities and would like to ' +
+        'start a process with the company once I know more about the job description.',
+      'I\'m particularly interested in AI engineering.'];
+      for (const text of ['I\'m interested.', 'I\'m interested!', 'I\'d love to join your team.',
+        'I\'m open to a call tomorrow at 3.', 'Count me in!', 'I\'m not looking right now.',
+        'I\'m available next week.', 'I\'m open to relocating to Berlin.', 'I\'d be happy to accept the offer.']) {
+        expect(reviewReply(text, facts), text).toMatchObject({ rule: 'commitment', hard: true });
+      }
+      expect(commitmentIssue('Yes, I\'m open to new opportunities. I\'d love to join!', facts))
+        .toBe('I\'d love to join!');
+    });
+    it('without a stated position, opportunity questions still get a request for details', async () => {
       const fetchMock = vi.fn<typeof fetch>()
         .mockResolvedValueOnce(completion(draft('I\'m open to interesting opportunities. What did you have in mind?')))
-        .mockResolvedValueOnce(completion(draft('I\'m also open to technical collaborations.')));
+        .mockResolvedValueOnce(completion(draft('I\'d love to hear about it.')));
       vi.stubGlobal('fetch', fetchMock);
       const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
         LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }),
-        ['I\'m also open to interesting technical collaborations and consulting opportunities.']);
+        ['I work at Example Corp as a mobile engineer.']);
       const reply = await withFacts.generate([syntheticMessage('m', 'Are you open to new opportunities?')],
         new AbortController().signal);
       expect(reply.reply).toBe('Could you share a few more details?');

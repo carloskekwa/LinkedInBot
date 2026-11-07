@@ -67,8 +67,17 @@ Redirects are disabled to avoid forwarding credentials to a different endpoint.
 npm run login          # manual login; exits after saving the local profile
 npm run inspect:live   # read-only structural DOM census -> data/dom-inspection.json
 npm run smoke:live     # read-only selector/thread check; prints counts, not bodies
+npm run probe:send     # types ONE character in a chat you open, reports Send state, removes it
 npm run start:dry      # reads/generates but never accepts or sends
 ```
+
+`probe:send` diagnoses a missing Send button. It opens Messaging and waits until you open
+a conversation in the browser and press Enter in the terminal. It then types a single "."
+into the composer, records which buttons the composer's form shows (class names and
+visible/enabled flags only, no text), checks the Send button with a non-clicking
+actionability check, removes the character and writes `data/send-probe.json`. **It never
+clicks Send.** The other person may briefly see a typing indicator, so use a chat with
+yourself or a friend who agreed. It refuses to run over an existing draft.
 
 `inspect:live` records tag/class/role/attribute *names* only, redacting profile and
 thread slugs — but button `aria-label`s on the invitation page contain inviter names.
@@ -195,8 +204,16 @@ The owner must restart the process if the browser is permanently closed.
    message identifier and no recognized pending/error marker. For invitations,
    inspect the profile's "Remove connection" menu item without activating it.
 4. Mark confirmed and consume the incoming batch atomically.
-5. On ambiguous outcomes/exceptions, mark uncertain. Re-read on later polls/restart.
-   Never resend/re-click just because the item is absent.
+5. On ambiguous outcomes/exceptions **after the click was dispatched**, mark uncertain.
+   Re-read on later polls/restart. Never resend/re-click just because the item is absent.
+6. A failure **before** the click (Send button missing or covered, Accept not clickable,
+   composer text not matching) changes nothing on LinkedIn. `handledAt` is only recorded
+   immediately before the click, after a non-clicking check that the click would land, so a
+   null `handledAt` proves nothing was clicked. Such an action is marked `failed`, not
+   `uncertain`, and does not block the chat. It is retried under a new key after a pause
+   (2, 4, then 8 minutes) at most three times; then the bot stops, logs an error and leaves
+   the message for you to answer. A pre-click action left blocked by an earlier version or a
+   crash is released the same way on the next run.
 
 The default candidate selectors for pending/error indicators must also be checked
 live. UI confirmation is not proof of recipient read or an independent server-side
@@ -206,7 +223,14 @@ problem: unstable DOM IDs, truncated history, deletion and optimistic UI updates
 Conservative uncertainty blocks the affected conversation rather than risking a
 duplicate. An old identical outgoing text before the anchor does not confirm a new send.
 
-Uncertain actions automatically become confirmed if later reads prove success.
+Uncertain actions automatically become confirmed if later reads prove success. They are
+re-checked on a schedule, not on every poll, because checking an invitation loads the
+person's profile page and LinkedIn throttles bursts of page loads: invitations after 5,
+10, 20 and 40 minutes, then hourly; replies after 0, 15 and 60 seconds, 5 minutes, then
+doubling up to hourly. A failed check is deferred the same way, and only an HTTP rejection
+pauses the worker. A restart re-checks an uncertain reply at once (it only reads the chat)
+but an uncertain invitation only after its first 5-minute delay, so startup does not add a
+profile page load to its own page loads.
 Otherwise they remain blocked for manual review. Stop, inspect the LinkedIn thread/
 profile and the relevant action before making any manual response. There is no unsafe
 "force retry" command; do not clear the database to retry an uncertain action.
@@ -238,8 +262,15 @@ tell any new connection (employer, role, location...). The bot may then answer "
 you work?" in the first person using only those lines. Anything not listed is treated as
 unknown and answered with "It's on my profile if you want to take a look." Startup logs
 whether facts were loaded. These lines are sent to the AI provider with every reply and can
-be repeated to the other person, so keep out phone numbers, private emails, addresses and
-salary. Lines still containing `<placeholders>` are ignored.
+be repeated to the other person, so keep out phone numbers, private emails and addresses.
+Lines still containing `<placeholders>` are ignored.
+**Positions are yours to state.** If you add a line such as "If asked about a new job or
+opportunity: I'm open to new opportunities and would like to start a process once I know
+more about the job description" or "If asked about salary: my expected salary range is X
+to Y", the bot answers those questions with it, in your words, and asks for the job
+description when none was given. Without such a line it asks for details and leaves the
+decision to you. A salary line is shown to anyone who asks, including strangers; add it
+only if you are comfortable with that.
 Direct location, employer and role questions should get only the answer, without a
 reciprocal question or assumptions about the sender's occupation. Recognized English
 direct-fact questions have question sentences removed from the draft before its remaining
@@ -256,9 +287,12 @@ that are not supported by the owner facts (questions are never treated as claims
 denials of experience or knowledge ("I don't have experience with X"), which are always
 rejected because a facts list can support a "yes" but never a "no"; and
 (3) support-bot phrasing and the stock "What about you?" follow-up, which assumes the
-sender's background. Openness, interests or availability are never stated for the owner,
-even if your facts mention them: opportunity, job, consulting and meeting questions get a
-request for details and the decision stays with you. Any hit triggers **one** rewrite request (about one extra
+sender's background. A statement of interest, availability or commitment passes only if
+the sentence has at least two content words and your facts support every one of them
+(so "I'm open to new opportunities" passes when you wrote that; "I'm interested.", "I'd
+love to join your team" or "I'm open to a call tomorrow" do not, whatever the facts say).
+This is a word-level heuristic: a paraphrase built only from words that happen to appear
+in your facts can slip through. Any hit triggers **one** rewrite request (about one extra
 second, only when needed). The model receives the latest incoming message explicitly,
 with earlier messages labeled as background and owner facts restricted to relevant asks.
 Recognized plain English greetings, wellbeing questions, thanks and closings must not
@@ -427,8 +461,16 @@ Observed against the owner's authenticated account with `inspect:live`/`smoke:li
   form "… invitation for …" are treated as connection requests. The account had **zero
   pending person requests** during validation, so **the person-card label format and the
   Accept click are still unverified live**.
-- The Send button only renders once the composer has content; it has **not** been
-  clicked live. Acceptance verification via the profile "More actions" menu is unverified.
+- The Send button is rendered at all times and is **disabled while the composer is empty**;
+  typing enables it (confirmed with `npm run probe:send` on 2026-11-07, where it was
+  visible, enabled and clickable after one typed character). The bot has **not** clicked
+  it live. It types with real keystrokes (about 20 ms per character), looks for
+  `button.msg-form__send-button` only inside the composer's own form and only if visible,
+  waits up to 5 s for it to become enabled, and refuses to send if the composer text
+  differs from the reply. A live Send failure reports which buttons the form actually
+  contained; `npm run probe:send` diagnoses it. The probe ran in a chat you opened
+  manually; sending through a chat the bot opened itself by clicking a card is not yet
+  verified. Acceptance verification via the profile "More actions" menu is unverified.
 
 ```sh
 npm run typecheck
