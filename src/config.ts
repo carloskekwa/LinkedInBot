@@ -1,0 +1,53 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { z } from 'zod';
+
+const bool = z.enum(['true', 'false']).transform(v => v === 'true');
+const positive = (fallback: number) => z.coerce.number().int().positive().default(fallback);
+const schema = z.object({
+  ACKNOWLEDGE_PLATFORM_RISK: bool.default(false),
+  DATA_DIR: z.string().default('./data'),
+  BROWSER_PROFILE: z.string().default('./user-data'),
+  INVITATION_POLL_MS: positive(20_000),
+  MESSAGE_POLL_MS: positive(10_000),
+  DEBOUNCE_MS: positive(7_000),
+  MAX_DEBOUNCE_MS: positive(20_000),
+  MAX_ACTIONS_PER_HOUR: positive(60),
+  THREAD_LIMIT: positive(30),
+  CONTEXT_MESSAGES: positive(8),
+  MAX_INPUT_CHARS: positive(12_000),
+  RETENTION_DAYS: positive(7),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  LLM_BASE_URL: z.url().default('http://127.0.0.1:11434/v1'),
+  LLM_MODEL: z.string().min(1).default('llama3.2'),
+  LLM_API_KEY: z.string().default(''),
+  LLM_TIMEOUT_MS: positive(15_000),
+  ALLOW_EXTERNAL_LLM: bool.default(false),
+  SYSTEM_PROMPT: z.string().default('./prompts/system.md'),
+  FALLBACK_REPLY: z.string().min(1).max(300).default(
+    "I'm the account owner's automated assistant, and I can't answer that reliably right now.",
+  ),
+  INITIAL_HISTORY: z.enum(['baseline', 'reply-latest']).default('baseline'),
+  SELECTORS_FILE: z.string().default(''),
+}).superRefine((value, ctx) => {
+  if (value.MAX_DEBOUNCE_MS < value.DEBOUNCE_MS) {
+    ctx.addIssue({ code: 'custom', message: 'MAX_DEBOUNCE_MS must be >= DEBOUNCE_MS' });
+  }
+  const url = new URL(value.LLM_BASE_URL);
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (!local && !value.ALLOW_EXTERNAL_LLM) {
+    ctx.addIssue({ code: 'custom', message: 'Remote LLM requires ALLOW_EXTERNAL_LLM=true' });
+  }
+  if ((!local && url.protocol !== 'https:') ||
+      !['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    ctx.addIssue({ code: 'custom', message: 'Use local HTTP or HTTPS without URL credentials' });
+  }
+});
+export type Config = z.infer<typeof schema>;
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  return schema.parse(env);
+}
+export function loadPrompt(config: Config): string {
+  return readFileSync(resolve(config.SYSTEM_PROMPT), 'utf8');
+}

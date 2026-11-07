@@ -1,0 +1,32 @@
+{
+  "name": "linkedin-account-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local, supervised LinkedIn account assistant with durable action reconciliation",
+  "engines": { "node": ">=20.20.0" },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
+    "test": "vitest run",
+    "start": "node dist/index.js",
+    "start:live": "node dist/index.js --live",
+    "start:dry": "node dist/index.js --dry-run",
+    "login": "node dist/index.js --login",
+    "smoke:live": "node dist/index.js --smoke",
+    "demo": "node dist/index.js --demo",
+    "report": "node dist/index.js --report"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "pino": "^10.1.0",
+    "playwright": "^1.56.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.19.0",
+    "typescript": "latest",
+    "vitest": "^4.1.12"
+  }
+}
