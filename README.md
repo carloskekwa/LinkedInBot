@@ -349,15 +349,27 @@ update channel could blind the bot. This deliberately does not assume a parked
 LinkedIn page always receives updates.
 
 **New connections.** A message from someone who is not yet a connection sits in the
-"Other" tab, where the bot does not look. Accepting the request moves it into the main
-inbox, but the loaded page only shows that after a reload. So each confirmed acceptance
-schedules one messaging reload about a minute later (`POST_ACCEPT_REFRESH_MS=60000`,
+"Other" folder. Accepting the request moves it into the main inbox, but the loaded page
+only shows that after a reload. So each confirmed acceptance
+schedules one messaging reload about two minutes later (`POST_ACCEPT_REFRESH_MS=120000`,
 +/-20%, never later than the reload already planned), and for at least 10 minutes after
 that, a thread that surfaces with old-looking activity is treated as new rather than as
 stale history, because a connection note is often days older than its acceptance. The
 trade-off: an unrelated old thread that LinkedIn happens to render late in that window
 would also be answered. Only confirmed acceptances count; uncertain ones do not trigger a
-reload. Threads are switched by **clicking the
+reload.
+
+**Inbox folders.** The inbox has a folder dropdown ("Focused" / "Other"); the bot reads
+both by default (`INBOX_FOLDERS=focused,other`), switching folders with in-app clicks, no
+page load, and re-opening a thread's card in the folder it was seen in. Each folder is
+baselined separately on its first scan. "Other" is where LinkedIn files messages it
+considers less relevant, including people who are not connections, so with this setting
+the bot also replies to strangers and sales outreach; set `INBOX_FOLDERS=focused` to
+stay in the main inbox. The dropdown was seen with `inspect:live` but its item labels were
+not recorded, so "Focused"/"Other" are assumed (`inboxFolderFocused`/`inboxFolderOther`
+selector overrides change them). `inspect:live` now opens the dropdown and records the
+labels under `inboxFolders`. If the folder cannot be switched, the focused inbox is still
+read and a warning is logged once an hour. Threads are switched by **clicking the
 conversation card inside the loaded app**, as a user would, and the adapter waits for
 the message view to actually change before reading, so it can never read the previous
 thread's messages as the new one. Direct URL navigation is only a fallback: in testing,

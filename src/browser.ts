@@ -3,10 +3,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Logger } from 'pino';
 import type { Config } from './config.js';
 import { loadSelectors, type Selectors } from './selectors.js';
+import { safeDetail } from './errors.js';
 import { hash, messageId, parseReceipt, unknownReceipt } from './time.js';
 import type { Invitation, LinkedInPort, Message, Thread, Verification } from './types.js';
 
 const origin = 'https://www.linkedin.com';
+export type InboxFolder = 'focused' | 'other';
+// How long to wait for the conversation list to show a newly selected folder.
+const FOLDER_SWITCH_MS = 8_000;
 // How long to wait for the message view to refresh after switching conversations.
 const SWITCH_SETTLE_MS = 5_000;
 // The "?invitationType=" filter did not narrow the list in practice (Page/newsletter
@@ -115,9 +119,15 @@ export class PlaywrightAdapter implements LinkedInPort {
   private readonly postAcceptRefreshMs: number;
   // Until this time, late-surfacing threads with old activity are not marked stale.
   private freshUntil = 0;
+  private readonly folders: InboxFolder[];
+  // Folder the loaded list currently shows; null right after a (re)load, when it is unknown.
+  private currentFolder: InboxFolder | null = null;
+  private readonly scannedFolders = new Set<InboxFolder>();
+  // Which folder each discovered thread's card was found in, so it can be re-opened by card.
+  private readonly threadFolder = new Map<string, InboxFolder>();
+  private lastFolderWarning = 0;
   private readonly threadLimit: number;
   private readonly changeWindowMs: number;
-  private scanned = false;
   // In-memory only: participant-name hash -> thread URL, preview fingerprints, change times.
   private readonly knownThreads = new Map<string, string>();
   private readonly fingerprints = new Map<string, string>();
@@ -136,6 +146,7 @@ export class PlaywrightAdapter implements LinkedInPort {
     this.invitationRefreshMs = config.INVITATION_REFRESH_MS;
     this.messageRefreshMs = config.MESSAGE_REFRESH_MS;
     this.postAcceptRefreshMs = config.POST_ACCEPT_REFRESH_MS;
+    this.folders = config.INBOX_FOLDERS.split(',') as InboxFolder[];
     // Long enough for the debounce cap plus two polls to observe the final message.
     this.changeWindowMs = config.MAX_DEBOUNCE_MS + 2 * config.MESSAGE_POLL_MS;
   }
@@ -327,10 +338,12 @@ export class PlaywrightAdapter implements LinkedInPort {
       this.nextMessageRefresh = jittered(Date.now(), this.messageRefreshMs);
       await this.messagesPage.goto(`${origin}/messaging/`, { waitUntil: 'domcontentloaded' });
       this.openThread = '';
+      this.currentFolder = null;
     } else if (Date.now() >= this.nextMessageRefresh) {
       this.nextMessageRefresh = jittered(Date.now(), this.messageRefreshMs);
       await this.messagesPage.reload({ waitUntil: 'domcontentloaded' });
       this.openThread = '';
+      this.currentFolder = null;
     }
     await this.messagesPage.locator(this.selectors.conversationList).first().waitFor();
     const links = await this.messagesPage.locator(this.selectors.conversationLink).all();
@@ -342,15 +355,62 @@ export class PlaywrightAdapter implements LinkedInPort {
       }
       return [...result];
     }
-    return this.discoverConversations();
+    const reported = new Set<string>();
+    for (const folder of this.folders) {
+      try { await this.switchFolder(folder); }
+      catch (error) {
+        // The folder UI is unverified live. Reading the other folders still works.
+        if (Date.now() - this.lastFolderWarning > 3_600_000) {
+          this.lastFolderWarning = Date.now();
+          this.log.warn({ folder, detail: safeDetail(error) },
+            'Could not switch inbox folder; that folder is not being read. Check the inboxFolder* selectors');
+        }
+        continue;
+      }
+      for (const id of await this.discoverConversations(folder)) reported.add(id);
+    }
+    return [...reported];
+  }
+  private folderLabel(folder: InboxFolder): string {
+    return folder === 'focused' ? this.selectors.inboxFolderFocused : this.selectors.inboxFolderOther;
+  }
+  // Selects an inbox folder through the folder dropdown, in-app, with no page load. The pill
+  // shows the current folder's name, so it tells both where the list is and when it changed.
+  private async switchFolder(folder: InboxFolder): Promise<void> {
+    if (this.currentFolder === folder) return;
+    const trigger = this.messagesPage.locator(this.selectors.inboxFolderTrigger).filter({ visible: true }).first();
+    const label = this.folderLabel(folder);
+    const showing = new RegExp(`(^|\\s)${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i');
+    if (!await trigger.count()) {
+      // No folder dropdown: the one list shown is the default (focused) inbox.
+      if (folder === 'focused') { this.currentFolder = 'focused'; return; }
+      throw new Error('Inbox folder dropdown not found');
+    }
+    if (showing.test(await trigger.innerText())) { this.currentFolder = folder; return; }
+    await trigger.click();
+    const item = this.messagesPage.locator(this.selectors.inboxFolderItem)
+      .filter({ visible: true }).filter({ hasText: new RegExp(`^\\s*${label}\\s*$`, 'i') }).first();
+    try { await item.waitFor({ timeout: 3_000 }); }
+    catch (error) {
+      await this.messagesPage.keyboard.press('Escape');
+      throw new Error(`No "${label}" item in the inbox folder dropdown`, { cause: error });
+    }
+    await item.click();
+    const deadline = Date.now() + FOLDER_SWITCH_MS;
+    while (!showing.test(await trigger.innerText()) && Date.now() < deadline) await delay(150);
+    if (!showing.test(await trigger.innerText())) throw new Error(`Inbox did not switch to "${label}"`);
+    // The list re-renders after the pill changes; give it a moment before reading cards.
+    await delay(800);
+    await this.messagesPage.locator(this.selectors.conversationList).first().waitFor();
+    this.currentFolder = folder;
   }
   // Current UI renders conversation cards without links. A card's thread URL is learned
-  // by clicking it once. The first scan reports every thread once (so history can be
-  // baselined); afterwards only cards whose preview changed are reported, for a bounded
-  // window that covers debouncing, so threads are not reloaded on every poll.
-  private async discoverConversations(): Promise<string[]> {
+  // by clicking it once. The first scan of a folder reports every thread once (so history
+  // can be baselined); afterwards only cards whose preview changed are reported, for a
+  // bounded window that covers debouncing, so threads are not reloaded on every poll.
+  private async discoverConversations(folder: InboxFolder = 'focused'): Promise<string[]> {
     const now = Date.now();
-    const firstScan = !this.scanned;
+    const firstScan = !this.scannedFolders.has(folder);
     const reported = new Set<string>();
     const items = await this.messagesPage.locator(this.selectors.conversationItem).all();
     for (const item of items.slice(0, this.threadLimit)) {
@@ -381,13 +441,15 @@ export class PlaywrightAdapter implements LinkedInPort {
         // an acceptance, though: that is the new connection's thread, however old its note.
         if (!firstScan && looksOld(timeLabel) && now >= this.freshUntil) this.staleLate.add(id);
       }
+      // A thread moves folders when a connection is accepted; remember where it was last seen.
+      this.threadFolder.set(id, folder);
       const previous = this.fingerprints.get(key);
       if (previous !== fingerprint) {
         this.fingerprints.set(key, fingerprint);
         if (firstScan) reported.add(id); else this.changedAt.set(id, now);
       }
     }
-    this.scanned = true;
+    this.scannedFolders.add(folder);
     for (const [id, at] of this.changedAt) {
       if (now - at < this.changeWindowMs) reported.add(id); else this.changedAt.delete(id);
     }
@@ -423,6 +485,11 @@ export class PlaywrightAdapter implements LinkedInPort {
     const key = [...this.knownThreads].find(([, url]) => url === safe)?.[0];
     if (!key) return false;
     const expectedPath = new URL(safe).pathname;
+    // The card only exists in the folder it was seen in; switch there first (no page load).
+    const folder = this.threadFolder.get(safe);
+    if (folder && this.folders.includes(folder) && this.currentFolder !== folder) {
+      try { await this.switchFolder(folder); } catch { return false; }
+    }
     for (const item of await this.messagesPage.locator(this.selectors.conversationItem).all()) {
       const names = await optionalText(item.locator(this.selectors.conversationNames));
       if (!names || hash(names) !== key) continue;

@@ -103,6 +103,27 @@ export async function inspectLive(config: Config, log: Logger, signal: AbortSign
     }
     out['messagingList'] = { probes: await probes(page),
       census: await census(page, 'msg|conversation|thread|message|compose|inbox|mailbox') };
+    // The inbox folder dropdown: its pill text and item labels ("Focused", "Other", ...) are UI
+    // chrome, not personal data, and the adapter matches folders by these labels.
+    const folderPill = page.locator('[data-test-messaging-inbox-filters__folder-pill], ' +
+      '.msg-cross-pillar-inbox-filters-v3__drop-down-trigger').filter({ visible: true }).first();
+    if (await folderPill.count()) {
+      const pillText = (await folderPill.innerText()).replace(/\s+/g, ' ').trim().slice(0, 40);
+      await folderPill.click();
+      await delay(1_000);
+      const items = await page.locator('.artdeco-dropdown__content li, .artdeco-dropdown__content [role="button"], ' +
+        '.artdeco-dropdown__content button, .artdeco-dropdown__item, [role="menuitem"], [role="option"]')
+        .filter({ visible: true }).evaluateAll(elements => elements.slice(0, 20).map(element => ({
+          tag: element.tagName.toLowerCase(),
+          classes: (typeof element.className === 'string' ? element.className : '').trim().split(/\s+/).slice(0, 4).join('.'),
+          role: element.getAttribute('role'),
+          label: (element.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 40),
+        })));
+      await page.keyboard.press('Escape');
+      out['inboxFolders'] = { pillText, items };
+    } else {
+      out['inboxFolders'] = 'no folder dropdown found; the inbox may show a single list or tabs';
+    }
 
     const thread = page.locator('a[href*="/messaging/thread/"]').first();
     if (await thread.count()) {

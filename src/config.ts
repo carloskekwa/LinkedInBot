@@ -26,6 +26,9 @@ const schema = z.object({
   // to the main inbox only once the messaging page reloads. One reload is scheduled this
   // long (+/-20%) after each confirmed acceptance, so the bot sees and answers that thread.
   POST_ACCEPT_REFRESH_MS: positive(120_000),
+  // Which inbox folders to read. "Other" holds messages LinkedIn filed as less relevant,
+  // including people who are not connections, so replies there reach strangers.
+  INBOX_FOLDERS: z.enum(['focused', 'focused,other']).default('focused,other'),
   DEBOUNCE_MS: positive(7_000),
   MAX_DEBOUNCE_MS: positive(20_000),
   MAX_ACTIONS_PER_HOUR: positive(60),

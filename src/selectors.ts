@@ -23,6 +23,12 @@ export const defaults = {
   conversationSnippet: '.msg-conversation-card__message-snippet, .msg-conversation-card__message-snippet--v2',
   conversationTime: '.msg-conversation-card__time-stamp',
   conversationSponsored: '[data-js-sponsored-conversation-hoverable-trigger]',
+  // The inbox folder dropdown ("Focused" / "Other"). Observed with inspect:live (Nov 2026); the
+  // menu items were not recorded, so inboxFolderItem is broad and matched by visible text.
+  inboxFolderTrigger: '[data-test-messaging-inbox-filters__folder-pill], .msg-cross-pillar-inbox-filters-v3__drop-down-trigger',
+  inboxFolderItem: '.artdeco-dropdown__content li, .artdeco-dropdown__content [role="button"], .artdeco-dropdown__content button, .artdeco-dropdown__item, [role="menuitem"], [role="option"]',
+  inboxFolderFocused: 'Focused',
+  inboxFolderOther: 'Other',
   thread: '.msg-s-message-list-content, .msg-s-message-list, .msg-s-message-list-container',
   message: '.msg-s-event-listitem[data-event-urn]',
   messageLegacy: '.msg-s-message-list__event',

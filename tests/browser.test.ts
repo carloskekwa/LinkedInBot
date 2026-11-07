@@ -258,6 +258,88 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
       expect((port as unknown as { nextMessageRefresh: number }).nextMessageRefresh).toBe(before);
     } finally { await port.close(); }
   });
+  // Like the live inbox (inspect:live, Nov 2026): a folder dropdown whose pill names the current
+  // folder; choosing "Other" swaps the list. Thread 1 lives in Focused, thread 9 in Other.
+  const folderFixture = fixture
+    .replace('<ul class="msg-conversations-container__conversations-list">',
+      '<div class="msg-cross-pillar-inbox-filters-v3__container">' +
+      '<button class="msg-cross-pillar-inbox-filters-v3__drop-down-trigger" ' +
+      'data-test-messaging-inbox-filters__folder-pill onclick="window.__menu.hidden = false">Focused</button>' +
+      '<div class="artdeco-dropdown__content" id="menu" hidden>' +
+      '<ul><li onclick="pickFolder(\'Focused\')"><span>Focused</span></li>' +
+      '<li onclick="pickFolder(\'Other\')"><span>Other</span></li>' +
+      '<li onclick="pickFolder(\'Unread\')"><span>Unread</span></li></ul></div></div>' +
+      '<ul class="msg-conversations-container__conversations-list">')
+    .replace('<script>', '<script>\n' +
+      'window.__menu = null; window.__switches = 0;\n' +
+      'document.addEventListener("DOMContentLoaded", () => { window.__menu = document.getElementById("menu"); });\n' +
+      'document.addEventListener("keydown", e => { if (e.key === "Escape" && window.__menu) window.__menu.hidden = true; });\n' +
+      'const otherList = \'<li class="msg-conversation-listitem"><div class="msg-conversation-listitem__link" ' +
+      'onclick="openFixtureThread(9)"><h3 class="msg-conversation-listitem__participant-names">Other contact</h3>' +
+      '<p class="msg-conversation-card__message-snippet">Message request</p>' +
+      '<time class="msg-conversation-card__time-stamp">Nov 2</time></div></li>\';\n' +
+      'let focusedList = null;\n' +
+      'function pickFolder(name) {\n' +
+      '  window.__menu.hidden = true; window.__switches++;\n' +
+      '  const pill = document.querySelector("[data-test-messaging-inbox-filters__folder-pill]");\n' +
+      '  const list = document.querySelector("ul.msg-conversations-container__conversations-list");\n' +
+      '  if (focusedList === null) focusedList = list.innerHTML;\n' +
+      '  setTimeout(() => {\n' +
+      '    pill.textContent = name;\n' +
+      '    list.innerHTML = name === "Other" ? otherList : focusedList;\n' +
+      '  }, 200);\n' +
+      '}');
+  it('reads both inbox folders through the folder dropdown and reopens cards in their own folder', async () => {
+    const { port, messages } = await adapter('', folderFixture);
+    try {
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      const first = await port.conversations();
+      const base = 'https://www.linkedin.com/messaging/thread/synthetic-';
+      expect(first.sort()).toEqual([base + '1/', base + '2/', base + '9/']);
+      expect(await messages.locator('[data-test-messaging-inbox-filters__folder-pill]').innerText()).toBe('Other');
+      // Reading the Other-folder thread again switches back to that folder, with no page load.
+      await messages.evaluate(() => { (window as unknown as Record<string, unknown>)['__m'] = 'kept'; });
+      await port.conversations();
+      const thread = await port.thread(base + '9/');
+      expect(thread.supported).toBe(true);
+      expect(messages.url()).toBe(base + '9/');
+      expect(await messages.evaluate(() => (window as unknown as Record<string, unknown>)['__m'])).toBe('kept');
+      // Folder switches are in-app clicks only, and none happen when the pill already shows the folder.
+      const switches = await messages.evaluate(() => (window as unknown as Record<string, unknown>)['__switches']);
+      expect(switches).toBeGreaterThanOrEqual(3);
+    } finally { await port.close(); }
+  });
+  it('reads only the focused folder when INBOX_FOLDERS=focused', async () => {
+    const { port, messages } = await adapter('', folderFixture, { INBOX_FOLDERS: 'focused' });
+    try {
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      const ids = await port.conversations();
+      expect(ids).not.toContain('https://www.linkedin.com/messaging/thread/synthetic-9/');
+      expect(await messages.evaluate(() => (window as unknown as Record<string, unknown>)['__switches'])).toBe(0);
+    } finally { await port.close(); }
+  });
+  it('keeps reading the focused inbox when the folder dropdown is missing or lacks "Other"', async () => {
+    const noOther = folderFixture.replace('<li onclick="pickFolder(\'Other\')"><span>Other</span></li>', '');
+    const lines: string[] = [];
+    const logger = pino({ level: 'warn' }, { write: (line: string) => { lines.push(line); } });
+    const context = await browser.newContext();
+    await context.route('**/*', route => route.fulfill({ contentType: 'text/html', body: noOther }));
+    const invitations = await context.newPage();
+    const messages = await context.newPage();
+    await messages.goto('https://www.linkedin.com/feed/');
+    const port = new PlaywrightAdapter(context, invitations, messages,
+      loadConfig({ ALLOW_EXTERNAL_LLM: 'true' }), logger);
+    try {
+      await port.initialize();
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      const ids = await port.conversations();
+      expect(ids).toContain('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      expect(lines.join('')).toContain('Could not switch inbox folder');
+      expect(lines.join('')).not.toContain('Other contact');
+      // The dropdown was closed again, so the list is still usable.
+      expect(await messages.locator('#menu').isHidden()).toBe(true);
+    } finally { await port.close(); }
+  });
   it('jitters refresh times within +/-20% of the interval', () => {
     expect(jittered(1000, 100_000, () => 0)).toBeCloseTo(81_000);
     expect(jittered(1000, 100_000, () => 1)).toBeCloseTo(121_000);
