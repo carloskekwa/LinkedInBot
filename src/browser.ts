@@ -9,7 +9,9 @@ import type { Invitation, LinkedInPort, Message, Thread, Verification } from './
 const origin = 'https://www.linkedin.com';
 // How long to wait for the message view to refresh after switching conversations.
 const SWITCH_SETTLE_MS = 5_000;
-const invitationsUrl = `${origin}/mynetwork/invitation-manager/received/?invitationType=CONNECTION`;
+// The "?invitationType=" filter did not narrow the list in practice (Page/newsletter
+// invitations still appeared), so the plain validated URL is used and cards are filtered.
+const invitationsUrl = `${origin}/mynetwork/invitation-manager/received/`;
 export function profileUrl(raw: string): string {
   const result = tryProfileUrl(raw);
   if (!result) throw new Error('Unexpected profile link; refusing navigation');
@@ -29,6 +31,10 @@ function threadUrl(raw: string): string {
   }
   return `${origin}${url.pathname}`;
 }
+// Next refresh time: the interval +/-20%, so reloads do not land on a fixed rhythm.
+export function jittered(now: number, intervalMs: number, random: () => number = Math.random): number {
+  return now + intervalMs * (0.8 + random() * 0.4);
+}
 // A card label that clearly means "before today" (weekday, date, "Yesterday"). Anything
 // else, including times of day and unrecognised formats, counts as fresh, so an unknown
 // format can never cause a real new message to be ignored.
@@ -47,8 +53,10 @@ export class PlaywrightAdapter implements LinkedInPort {
   private readonly selectors: Selectors;
   private readonly configuredOwner: string;
   private openThread = '';
-  private lastInvitationRefresh = 0;
-  private lastMessageRefresh = 0;
+  private nextInvitationRefresh = 0;
+  private nextMessageRefresh = 0;
+  private readonly invitationRefreshMs: number;
+  private readonly messageRefreshMs: number;
   private readonly threadLimit: number;
   private readonly changeWindowMs: number;
   private scanned = false;
@@ -67,6 +75,8 @@ export class PlaywrightAdapter implements LinkedInPort {
     this.selectors = loadSelectors(config.SELECTORS_FILE);
     this.configuredOwner = config.OWNER_PROFILE_URL;
     this.threadLimit = config.THREAD_LIMIT;
+    this.invitationRefreshMs = config.INVITATION_REFRESH_MS;
+    this.messageRefreshMs = config.MESSAGE_REFRESH_MS;
     // Long enough for the debounce cap plus two polls to observe the final message.
     this.changeWindowMs = config.MAX_DEBOUNCE_MS + 2 * config.MESSAGE_POLL_MS;
   }
@@ -146,7 +156,8 @@ export class PlaywrightAdapter implements LinkedInPort {
     }
     await this.invitationsPage.goto(invitationsUrl, { waitUntil: 'domcontentloaded' });
     await this.messagesPage.goto(`${origin}/messaging/`, { waitUntil: 'domcontentloaded' });
-    this.lastInvitationRefresh = this.lastMessageRefresh = Date.now();
+    this.nextInvitationRefresh = jittered(Date.now(), this.invitationRefreshMs);
+    this.nextMessageRefresh = jittered(Date.now(), this.messageRefreshMs);
     await this.healthCheck();
   }
   ownerIdentity(): string {
@@ -160,12 +171,13 @@ export class PlaywrightAdapter implements LinkedInPort {
   }
   private async ensureInvitationList(): Promise<void> {
     if (!this.invitationsPage.url().includes('/invitation-manager')) {
+      this.nextInvitationRefresh = jittered(Date.now(), this.invitationRefreshMs);
       await this.invitationsPage.goto(invitationsUrl, { waitUntil: 'domcontentloaded' });
-      this.lastInvitationRefresh = Date.now();
-    } else if (Date.now() - this.lastInvitationRefresh > 60_000) {
-      // A parked page is not guaranteed to receive invitations live.
+    } else if (Date.now() >= this.nextInvitationRefresh) {
+      // A parked page is not guaranteed to receive invitations live. The next reload is
+      // scheduled first, so a failing reload is not retried on every poll.
+      this.nextInvitationRefresh = jittered(Date.now(), this.invitationRefreshMs);
       await this.invitationsPage.reload({ waitUntil: 'domcontentloaded' });
-      this.lastInvitationRefresh = Date.now();
     }
     await this.invitationsPage.locator('main').first().waitFor();
     await this.invitationsPage.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => undefined);
@@ -230,12 +242,12 @@ export class PlaywrightAdapter implements LinkedInPort {
   }
   async conversations(): Promise<string[]> {
     if (!this.messagesPage.url().includes('/messaging/')) {
+      this.nextMessageRefresh = jittered(Date.now(), this.messageRefreshMs);
       await this.messagesPage.goto(`${origin}/messaging/`, { waitUntil: 'domcontentloaded' });
-      this.lastMessageRefresh = Date.now();
       this.openThread = '';
-    } else if (Date.now() - this.lastMessageRefresh > 300_000) {
+    } else if (Date.now() >= this.nextMessageRefresh) {
+      this.nextMessageRefresh = jittered(Date.now(), this.messageRefreshMs);
       await this.messagesPage.reload({ waitUntil: 'domcontentloaded' });
-      this.lastMessageRefresh = Date.now();
       this.openThread = '';
     }
     await this.messagesPage.locator(this.selectors.conversationList).first().waitFor();

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { chromium, type Browser } from 'playwright';
 import { pino } from 'pino';
-import { PlaywrightAdapter, looksOld, profileUrl } from '../src/browser.js';
+import { PlaywrightAdapter, jittered, looksOld, profileUrl } from '../src/browser.js';
 import { loadConfig } from '../src/config.js';
 import { hash } from '../src/time.js';
 
@@ -120,7 +120,7 @@ const fixture = `
 
 beforeAll(async () => { browser = await chromium.launch({ headless: true }); });
 afterAll(async () => { if (browser) await browser.close(); });
-async function adapter(ownerUrl = '', html = fixture) {
+async function adapter(ownerUrl = '', html = fixture, env: Record<string, string> = {}) {
   const context = await browser.newContext();
   // All requests are fulfilled locally; no LinkedIn/network access in this suite.
   await context.route('**/*', route => route.fulfill({ contentType: 'text/html', body: html }));
@@ -128,7 +128,7 @@ async function adapter(ownerUrl = '', html = fixture) {
   const messages = await context.newPage();
   await messages.goto('https://www.linkedin.com/feed/');
   const port = new PlaywrightAdapter(context, invitations, messages,
-    loadConfig({ ALLOW_EXTERNAL_LLM: 'true', OWNER_PROFILE_URL: ownerUrl }), pino({ level: 'silent' }));
+    loadConfig({ ALLOW_EXTERNAL_LLM: 'true', OWNER_PROFILE_URL: ownerUrl, ...env }), pino({ level: 'silent' }));
   try { await port.initialize(); }
   catch (error) { await port.close(); throw error; }
   return { port, invitations, messages };
@@ -175,6 +175,22 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
     expect(profileUrl('/in/synthetic/?tracking=1')).toBe('https://www.linkedin.com/in/synthetic/');
     expect(() => profileUrl('https://example.invalid/in/synthetic/')).toThrow();
   });
+  it('reloads pages only when a refresh is due, not on every poll', async () => {
+    const mark = () => { (window as unknown as Record<string, unknown>)['__m'] = 'kept'; };
+    const read = () => (window as unknown as Record<string, unknown>)['__m'];
+    const calm = await adapter();
+    try {
+      await calm.invitations.evaluate(mark);
+      await calm.port.invitations(); await calm.port.invitations(); await calm.port.invitations();
+      expect(await calm.invitations.evaluate(read)).toBe('kept');
+    } finally { await calm.port.close(); }
+    const due = await adapter('', fixture, { INVITATION_REFRESH_MS: '1' });
+    try {
+      await due.invitations.evaluate(mark);
+      await due.port.invitations();
+      expect(await due.invitations.evaluate(read)).toBeUndefined();
+    } finally { await due.port.close(); }
+  });
   it('flags cards with clearly old activity that surface after startup, and fails open otherwise', async () => {
     const { port, messages } = await adapter();
     try {
@@ -201,6 +217,11 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
       expect(reported.sort()).toEqual([base + '3/', base + '4/', base + '5/']);
       expect([...port.staleConversations()]).toEqual([base + '3/']);
     } finally { await port.close(); }
+  });
+  it('jitters refresh times within +/-20% of the interval', () => {
+    expect(jittered(1000, 100_000, () => 0)).toBeCloseTo(81_000);
+    expect(jittered(1000, 100_000, () => 1)).toBeCloseTo(121_000);
+    expect(jittered(1000, 100_000, () => 0.5)).toBeCloseTo(101_000);
   });
   it('classifies card activity labels as old only when clearly before today', () => {
     for (const old of ['Nov 3', 'Nov 3, 2025', '3 Nov', 'Yesterday', 'Fri', 'Saturday', '11/03/2025', '03.11.2025']) {

@@ -224,8 +224,17 @@ debounce 7 seconds after a change, capped at 20 seconds; 60 external actions/hou
 The elapsed worker time is subtracted from the wait to avoid overlapping intervals.
 Actual debounce resolution is limited by polling and thread navigation.
 
-The invitation page is refreshed at most once/minute during normal reads, and the
-messaging page at most once/five minutes. This deliberately does not assume a parked
+Polls only read the already-loaded page. Full reloads are separate and rarer: the
+invitation page reloads about every 3 minutes (`INVITATION_REFRESH_MS=180000`) and the
+messaging page about every 5 minutes (`MESSAGE_REFRESH_MS=300000`), each with +/-20%
+jitter. The messaging page also updates live between reloads (a real message was
+detected with no reload in live testing). **Measured:** reloading the invitation page
+every 60 seconds was rejected by LinkedIn with HTTP errors within the first minute, so
+the defaults are deliberately conservative. As a consequence, an invitation can wait up
+to roughly one refresh interval before it is seen, so expect acceptance latency of a few
+minutes, not seconds; lowering `INVITATION_REFRESH_MS` speeds this up but raises the
+risk of throttling. The messaging reload also bounds how long a silently dead live
+update channel could blind the bot. This deliberately does not assume a parked
 LinkedIn page always receives updates. Threads are switched by **clicking the
 conversation card inside the loaded app**, as a user would, and the adapter waits for
 the message view to actually change before reading, so it can never read the previous
@@ -322,7 +331,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **82 tests in 4 files** passed;
+`npm run typecheck` and `npm run build` passed; all **84 tests in 4 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.
