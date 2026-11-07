@@ -3,9 +3,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Logger } from 'pino';
 import type { Config } from './config.js';
 import { Store } from './storage.js';
+import { safeDetail } from './errors.js';
 import { hash, timing } from './time.js';
 import type { Action, LinkedInPort, Message, ReplyGenerator, Thread } from './types.js';
 
+// A thread that errors is left alone this long, so one broken thread cannot cause
+// repeated page loads against LinkedIn.
+const THREAD_COOLDOWN_MS = 120_000;
 interface Batch { first: number; lastChange: number; signature: string }
 export function incomingBatch(thread: Thread, store: Pick<Store, 'consumed'>): Message[] {
   if (!thread.supported || thread.messages.at(-1)?.own !== false) return [];
@@ -15,6 +19,7 @@ export function incomingBatch(thread: Thread, store: Pick<Store, 'consumed'>): M
 
 export class Bot {
   private readonly batches = new Map<string, Batch>();
+  private readonly quarantine = new Map<string, number>();
   private lastHealthLog = 0;
   private lastPrune = 0;
   private initialThreads: Set<string> | undefined;
@@ -130,77 +135,92 @@ export class Bot {
     for (const id of ids) {
       this.checkStop();
       if (this.store.unresolved(id).length) continue;
-      const thread = await this.port.thread(id);
-      if (!thread.supported) continue;
-      this.observe(thread);
-      const incoming = incomingBatch(thread, this.store);
-      if (incoming.length === 0) { this.batches.delete(id); continue; }
-      const signature = hash(JSON.stringify(incoming.map(m => m.id)));
-      const existing = this.batches.get(id);
-      const batch = existing ?? { first: this.now(), lastChange: this.now(), signature };
-      if (batch.signature !== signature) { batch.lastChange = this.now(); batch.signature = signature; }
-      this.batches.set(id, batch);
-      if (this.now() - batch.lastChange < this.config.DEBOUNCE_MS &&
-          this.now() - batch.first < this.config.MAX_DEBOUNCE_MS) continue;
-      if (this.live && !this.canAct()) continue;
-
-      const start = performance.now();
-      let reply;
+      if ((this.quarantine.get(id) ?? 0) > this.now()) continue;
       try {
-        reply = await this.generator.generate(thread.messages, this.signal);
+        await this.processThread(id);
       } catch (error) {
         if (this.signal.aborted) throw error;
-        this.log.error({ errorType: error instanceof Error ? error.name : 'unknown', ref: hash(id) },
-          'LLM unavailable or output invalid; using explicit automated-assistant fallback');
-        reply = { should_reply: true, reply: this.config.FALLBACK_REPLY, language: 'unknown', reason: 'fallback' };
-      }
-      const llmMs = Math.round(performance.now() - start);
-      const generatedAt = this.now();
-      this.checkStop();
-      const fresh = await this.port.thread(id);
-      if (!fresh.supported) { this.batches.delete(id); continue; }
-      this.observe(fresh);
-      const freshIncoming = incomingBatch(fresh, this.store);
-      if (hash(JSON.stringify(freshIncoming.map(m => m.id))) !== signature) {
-        this.log.info({ ref: hash(id) }, 'Thread changed during generation; discarded stale draft');
-        continue;
-      }
-      if (!reply.should_reply) {
-        this.store.consume(incoming.map(m => m.id));
+        // One unreadable thread must not stop the others or trigger a reload storm.
+        this.quarantine.set(id, this.now() + THREAD_COOLDOWN_MS);
         this.batches.delete(id);
-        this.log.info({ ref: hash(id) }, 'No reply appropriate; batch handled without sending');
-        continue;
+        this.log.warn({ ref: hash(id), detail: safeDetail(error),
+          retryInSeconds: THREAD_COOLDOWN_MS / 1000 },
+          'Thread skipped after an error; other threads continue');
       }
-      if (!this.live) {
-        this.store.consume(incoming.map(m => m.id));
-        this.batches.delete(id);
-        this.log.info({ ref: hash(id), replyLength: reply.reply.length,
-          replyHash: hash(reply.reply) }, 'Dry-run: would reply (body intentionally not logged)');
-        continue;
-      }
-      if (!this.canAct() || !await this.port.authenticated()) continue;
-      const first = this.store.observe(incoming[0]!.id, id, incoming[0]!.receipt, this.now());
-      const action = this.store.create({
-        kind: 'reply', ref: id, key: `reply:${id}:${signature}`,
-        incomingIds: incoming.map(m => m.id), textHash: hash(reply.reply),
-        timing: timing(incoming, first.detectedAt),
-        generatedAt, llmMs, debounceMs: Math.max(0, generatedAt - batch.first - llmMs),
-      });
-      this.store.transition(action, 'executing', this.now());
-      try {
-        await this.port.send(id, reply.reply, this.dispatch(action));
-        const result = await this.port.verifySend(id, hash(reply.reply), incoming.at(-1)!.id);
-        this.store.transition(action, result === 'confirmed' ? 'confirmed' : 'uncertain', this.now());
-        if (result === 'confirmed') this.logConfirmation(action);
-        else this.log.warn({ actionId: action.id }, 'Send uncertain; no automatic retry');
-      } catch (error) {
-        this.store.transition(action, 'uncertain', this.now());
-        this.log.error({ actionId: action.id, errorType: error instanceof Error ? error.name : 'unknown' },
-          'Send failed or outcome uncertain; conversation blocked until reconciled');
-        if (this.signal.aborted) throw error;
-      }
-      this.batches.delete(id);
     }
+  }
+  private async processThread(id: string): Promise<void> {
+    const thread = await this.port.thread(id);
+    if (!thread.supported) return;
+    this.observe(thread);
+    const incoming = incomingBatch(thread, this.store);
+    if (incoming.length === 0) { this.batches.delete(id); return; }
+    const signature = hash(JSON.stringify(incoming.map(m => m.id)));
+    const existing = this.batches.get(id);
+    const batch = existing ?? { first: this.now(), lastChange: this.now(), signature };
+    if (batch.signature !== signature) { batch.lastChange = this.now(); batch.signature = signature; }
+    this.batches.set(id, batch);
+    if (this.now() - batch.lastChange < this.config.DEBOUNCE_MS &&
+        this.now() - batch.first < this.config.MAX_DEBOUNCE_MS) return;
+    if (this.live && !this.canAct()) return;
+
+    const start = performance.now();
+    let reply;
+    try {
+      reply = await this.generator.generate(thread.messages, this.signal);
+    } catch (error) {
+      if (this.signal.aborted) throw error;
+      this.log.error({ errorType: error instanceof Error ? error.name : 'unknown',
+        detail: safeDetail(error), ref: hash(id) },
+        'LLM unavailable or output invalid; using explicit automated-assistant fallback');
+      reply = { should_reply: true, reply: this.config.FALLBACK_REPLY, language: 'unknown', reason: 'fallback' };
+    }
+    const llmMs = Math.round(performance.now() - start);
+    const generatedAt = this.now();
+    this.checkStop();
+    const fresh = await this.port.thread(id);
+    if (!fresh.supported) { this.batches.delete(id); return; }
+    this.observe(fresh);
+    const freshIncoming = incomingBatch(fresh, this.store);
+    if (hash(JSON.stringify(freshIncoming.map(m => m.id))) !== signature) {
+      this.log.info({ ref: hash(id) }, 'Thread changed during generation; discarded stale draft');
+      return;
+    }
+    if (!reply.should_reply) {
+      this.store.consume(incoming.map(m => m.id));
+      this.batches.delete(id);
+      this.log.info({ ref: hash(id) }, 'No reply appropriate; batch handled without sending');
+      return;
+    }
+    if (!this.live) {
+      this.store.consume(incoming.map(m => m.id));
+      this.batches.delete(id);
+      this.log.info({ ref: hash(id), replyLength: reply.reply.length,
+        replyHash: hash(reply.reply) }, 'Dry-run: would reply (body intentionally not logged)');
+      return;
+    }
+    if (!this.canAct() || !await this.port.authenticated()) return;
+    const first = this.store.observe(incoming[0]!.id, id, incoming[0]!.receipt, this.now());
+    const action = this.store.create({
+      kind: 'reply', ref: id, key: `reply:${id}:${signature}`,
+      incomingIds: incoming.map(m => m.id), textHash: hash(reply.reply),
+      timing: timing(incoming, first.detectedAt),
+      generatedAt, llmMs, debounceMs: Math.max(0, generatedAt - batch.first - llmMs),
+    });
+    this.store.transition(action, 'executing', this.now());
+    try {
+      await this.port.send(id, reply.reply, this.dispatch(action));
+      const result = await this.port.verifySend(id, hash(reply.reply), incoming.at(-1)!.id);
+      this.store.transition(action, result === 'confirmed' ? 'confirmed' : 'uncertain', this.now());
+      if (result === 'confirmed') this.logConfirmation(action);
+      else this.log.warn({ actionId: action.id }, 'Send uncertain; no automatic retry');
+    } catch (error) {
+      this.store.transition(action, 'uncertain', this.now());
+      this.log.error({ actionId: action.id, errorType: error instanceof Error ? error.name : 'unknown',
+        detail: safeDetail(error) }, 'Send failed or outcome uncertain; conversation blocked until reconciled');
+      if (this.signal.aborted) throw error;
+    }
+    this.batches.delete(id);
   }
   async run(): Promise<void> {
     const loop = async (worker: string, interval: number, tick: () => Promise<void>) => {
@@ -214,7 +234,8 @@ export class Bot {
           if (this.signal.aborted) break;
           failures++;
           this.store.heartbeat(worker, 'error', this.now());
-          this.log.error({ worker, errorType: error instanceof Error ? error.name : 'unknown' },
+          this.log.error({ worker, errorType: error instanceof Error ? error.name : 'unknown',
+            detail: safeDetail(error) },
             'Worker failed; bounded backoff before retry (external writes are never replayed)');
         }
         if (this.now() - this.lastHealthLog >= 300_000) {

@@ -10,6 +10,7 @@ import { acquireLock } from './lock.js';
 import { report } from './metrics.js';
 import { demo } from './demo.js';
 import { inspectLive } from './inspect.js';
+import { safeDetail } from './errors.js';
 
 const controller = new AbortController();
 process.once('SIGINT', () => controller.abort());
@@ -82,10 +83,8 @@ async function main(): Promise<void> {
           exactReceipts += thread.messages.filter(m => m.receipt.precision === 'exact').length;
         } catch (error) {
           classificationFailures++;
-          const message = error instanceof Error ? error.message : '';
           log.warn({ errorType: error instanceof Error ? error.name : 'unknown',
-            // Only static diagnostics are logged; anything containing URLs/paths is withheld.
-            detail: message && !/[/\\]|https?:/i.test(message) ? message.slice(0, 200) : undefined },
+            detail: safeDetail(error) },
             'Thread could not be read/classified; the bot would skip it');
         }
       }

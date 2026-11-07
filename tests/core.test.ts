@@ -57,6 +57,23 @@ describe('action orchestration', () => {
     expect(s.fake.sent).toHaveLength(1);
     expect(s.store.all()[0]?.status).toBe('confirmed');
   });
+  it('skips a failing thread without blocking others and does not retry it every poll', async () => {
+    const s = setup();
+    s.fake.threads.set('bad', { id: 'bad', supported: true, messages: [syntheticMessage('b1')] });
+    s.fake.failingThreads.add('bad');
+    s.fake.threads.get('t')!.messages = [syntheticMessage('m1')];
+    await reply(s);
+    expect(s.fake.sent.map(m => m.id)).toEqual(['t']);
+    const reads = s.fake.threadReads.get('bad')!;
+    for (let i = 0; i < 5; i++) { s.advance(); await s.bot.messageTick(); }
+    expect(s.fake.threadReads.get('bad')).toBe(reads);
+    s.advance(130_000); await s.bot.messageTick();
+    expect(s.fake.threadReads.get('bad')).toBe(reads + 1);
+  });
+  it('still stops promptly when aborted during thread processing', async () => {
+    const s = setup(); s.controller.abort();
+    await expect(s.bot.messageTick()).rejects.toThrow();
+  });
   it('baselines existing history by default then replies to a new message', async () => {
     const s = setup({ INITIAL_HISTORY: 'baseline' });
     await reply(s); expect(s.fake.sent).toHaveLength(0);

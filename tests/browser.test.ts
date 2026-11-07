@@ -188,12 +188,13 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
         'https://www.linkedin.com/messaging/thread/synthetic-1/',
         'https://www.linkedin.com/messaging/thread/synthetic-2/',
       ]);
-      // Simulate time passing beyond the change window: nothing changed, nothing reported.
+      // Nothing changed: the second scan must not re-report (or reload) any thread.
+      expect(await port.conversations()).toEqual([]);
       await messages.evaluate(() => {
         document.querySelector('.msg-conversation-card__message-snippet')!.textContent = 'New message';
       });
       const second = await port.conversations();
-      expect(second).toContain('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      expect(second).toEqual(['https://www.linkedin.com/messaging/thread/synthetic-1/']);
     } finally { await port.close(); }
   });
   it('classifies incoming/own messages and verifies a new send after the inbound anchor', async () => {

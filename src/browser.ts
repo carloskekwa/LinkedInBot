@@ -38,10 +38,13 @@ export class PlaywrightAdapter implements LinkedInPort {
   private lastInvitationRefresh = 0;
   private lastMessageRefresh = 0;
   private readonly threadLimit: number;
+  private readonly changeWindowMs: number;
+  private scanned = false;
   // In-memory only: participant-name hash -> thread URL, preview fingerprints, change times.
   private readonly knownThreads = new Map<string, string>();
   private readonly fingerprints = new Map<string, string>();
   private readonly changedAt = new Map<string, number>();
+  private readonly cardRetryAt = new Map<string, number>();
   // Alternative URL forms of the owner's own profile link, learned from one-to-one threads.
   private readonly ownerAliases = new Set<string>();
   constructor(
@@ -51,6 +54,8 @@ export class PlaywrightAdapter implements LinkedInPort {
     this.selectors = loadSelectors(config.SELECTORS_FILE);
     this.configuredOwner = config.OWNER_PROFILE_URL;
     this.threadLimit = config.THREAD_LIMIT;
+    // Long enough for the debounce cap plus two polls to observe the final message.
+    this.changeWindowMs = config.MAX_DEBOUNCE_MS + 2 * config.MESSAGE_POLL_MS;
   }
 
   static async open(config: Config, log: Logger): Promise<PlaywrightAdapter> {
@@ -230,39 +235,54 @@ export class PlaywrightAdapter implements LinkedInPort {
     return this.discoverConversations();
   }
   // Current UI renders conversation cards without links. A card's thread URL is learned
-  // by clicking it once; afterwards only cards whose preview changed are reported.
+  // by clicking it once. The first scan reports every thread once (so history can be
+  // baselined); afterwards only cards whose preview changed are reported, for a bounded
+  // window that covers debouncing, so threads are not reloaded on every poll.
   private async discoverConversations(): Promise<string[]> {
     const now = Date.now();
+    const firstScan = !this.scanned;
+    const reported = new Set<string>();
     const items = await this.messagesPage.locator(this.selectors.conversationItem).all();
     for (const item of items.slice(0, this.threadLimit)) {
       if (await item.locator(this.selectors.conversationSponsored).count()) continue;
       const names = await optionalText(item.locator(this.selectors.conversationNames));
       if (!names) continue;
       const key = hash(names);
+      if ((this.cardRetryAt.get(key) ?? 0) > now) continue;
       const fingerprint = hash(JSON.stringify([names,
         await optionalText(item.locator(this.selectors.conversationSnippet)),
         await optionalText(item.locator(this.selectors.conversationTime))]));
       let id = this.knownThreads.get(key);
       if (!id) {
-        if (await item.locator(this.selectors.conversationActive).count()) {
-          id = threadUrl(this.messagesPage.url());
-        } else {
-          const previous = this.messagesPage.url();
-          await item.locator(this.selectors.conversationItemLink).first().click();
-          await this.messagesPage.waitForURL(url =>
-            url.href !== previous && url.pathname.startsWith('/messaging/thread/'));
-          id = threadUrl(this.messagesPage.url());
+        try {
+          if (await item.locator(this.selectors.conversationActive).count()) {
+            id = threadUrl(this.messagesPage.url());
+          } else {
+            const previous = this.messagesPage.url();
+            await item.locator(this.selectors.conversationItemLink).first().click();
+            await this.messagesPage.waitForURL(url =>
+              url.href !== previous && url.pathname.startsWith('/messaging/thread/'));
+            id = threadUrl(this.messagesPage.url());
+          }
+        } catch {
+          this.cardRetryAt.set(key, now + 120_000);
+          this.log.warn({ ref: key.slice(0, 12) }, 'Conversation card could not be opened; retrying later');
+          continue;
         }
         this.openThread = id;
         this.knownThreads.set(key, id);
       }
-      if (this.fingerprints.get(key) !== fingerprint) {
+      const previous = this.fingerprints.get(key);
+      if (previous !== fingerprint) {
         this.fingerprints.set(key, fingerprint);
-        this.changedAt.set(id, now);
+        if (firstScan) reported.add(id); else this.changedAt.set(id, now);
       }
     }
-    return [...this.changedAt.entries()]
-      .filter(([, at]) => now - at < 120_000).map(([id]) => id);
+    this.scanned = true;
+    for (const [id, at] of this.changedAt) {
+      if (now - at < this.changeWindowMs) reported.add(id); else this.changedAt.delete(id);
+    }
+    return [...reported];
   }
   private async openConversation(id: string): Promise<void> {
     const safe = threadUrl(id);

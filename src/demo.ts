@@ -16,6 +16,8 @@ export class FakeAdapter implements LinkedInPort {
   uncertainAccept = false;
   throwAfterSend = false;
   closed = false;
+  failingThreads = new Set<string>();
+  threadReads = new Map<string, number>();
   async authenticated(): Promise<boolean> { return this.loggedIn; }
   async invitations(): Promise<Invitation[]> { return structuredClone(this.pending); }
   async accept(id: string, beforeClick: () => void): Promise<void> {
@@ -28,6 +30,8 @@ export class FakeAdapter implements LinkedInPort {
   }
   async conversations(): Promise<string[]> { return [...this.threads.keys()]; }
   async thread(id: string): Promise<Thread> {
+    this.threadReads.set(id, (this.threadReads.get(id) ?? 0) + 1);
+    if (this.failingThreads.has(id)) throw new Error('Synthetic thread failure');
     const thread = this.threads.get(id);
     if (!thread) throw new Error('Missing fake thread');
     return structuredClone(thread);
