@@ -34,12 +34,14 @@ const schema = z.object({
   LLM_MODEL: z.string().min(1).default('gpt-4o-mini'),
   LLM_API_KEY: z.string().trim().default(''),
   LLM_TIMEOUT_MS: positive(15_000),
+  // Higher = more varied wording; lower = more predictable.
+  LLM_TEMPERATURE: z.coerce.number().min(0).max(1.5).default(0.8),
   ALLOW_EXTERNAL_LLM: bool.default(false),
   // Logs incoming message text and the AI's answer. Private data: for local debugging only.
   LOG_MESSAGE_TEXT: bool.default(false),
   SYSTEM_PROMPT: z.string().default('./prompts/system.md'),
   FALLBACK_REPLY: z.string().min(1).max(300).default(
-    "I'm the account owner's automated assistant, and I can't answer that reliably right now.",
+    "Thanks for your message! This is an automated reply, and I can't give you a proper answer right now.",
   ),
   INITIAL_HISTORY: z.enum(['baseline', 'reply-latest']).default('baseline'),
   SELECTORS_FILE: z.string().default(''),

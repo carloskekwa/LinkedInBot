@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { pino } from 'pino';
 import { loadConfig } from '../src/config.js';
-import { guardReply, LlmGenerator } from '../src/ai.js';
+import { guardReply, LlmGenerator, reviewReply } from '../src/ai.js';
 import { syntheticMessage } from '../src/demo.js';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -67,6 +67,7 @@ describe('configuration and LLM contract', () => {
     const body = JSON.parse(String(options.body));
     expect(body.response_format).toEqual({ type: 'json_object' });
     expect(body.model).toBe('gpt-4o-mini');
+    expect(body.temperature).toBe(0.8);
     expect(options.headers).toMatchObject({ Authorization: 'Bearer synthetic-test-key' });
     const context = JSON.parse(body.messages[1].content).untrustedConversationData;
     expect(context[0].text).toHaveLength(1000);
@@ -79,6 +80,82 @@ describe('configuration and LLM contract', () => {
     const generator = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
       LLM_API_KEY: 'synthetic-test-key' }), 'test', pino({ level: 'silent' }));
     await expect(generator.generate([], new AbortController().signal)).rejects.toThrow('HTTP 503');
+  });
+  describe('one-time rewrite of unusable or rule-breaking drafts', () => {
+    const completion = (content: string) => new Response(JSON.stringify({
+      choices: [{ message: { content } }] }));
+    const draft = (reply: string) => JSON.stringify({ ...valid, reply });
+    const generator = () => new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+      LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }));
+    const run = (responses: Response[]) => {
+      const fetchMock = vi.fn<typeof fetch>();
+      for (const response of responses) fetchMock.mockResolvedValueOnce(response);
+      vi.stubGlobal('fetch', fetchMock);
+      return { fetchMock, result: () => generator().generate(
+        [syntheticMessage('m', 'hello')], new AbortController().signal) };
+    };
+
+    it('flags commitments and support-bot phrasing, including curly apostrophes', () => {
+      for (const text of ['I\u2019d love to hear more.', 'I\'m interested in the role', 'Count me in!',
+        'I will definitely join', 'I\u2019ll be there', 'I\'d be interested to hear more',
+        'I would be happy to chat', 'I\u2019m open to that']) {
+        expect(reviewReply(text), text).toMatchObject({ hard: true });
+      }
+      for (const text of ['How can I assist you today?', 'What can I help you with?',
+        'Thank you for reaching out!', 'Feel free to ask', 'I\'m here to help with your questions!',
+        'I\'ll do my best to help.', 'I understand it can be frustrating.']) {
+        expect(reviewReply(text), text).toMatchObject({ hard: false });
+      }
+      for (const text of ['Hey! What\'s up?', 'Could you share a few details?', '\ud83d\udc4d', 'Anytime!',
+        'Sure, go ahead.', 'Thanks! Glad it landed.', 'Not something I can answer properly here.']) {
+        expect(reviewReply(text), text).toBeNull();
+      }
+    });
+    it('asks for exactly one rewrite and uses it', async () => {
+      const { fetchMock, result } = run([
+        completion(draft('I\u2019d love to hear more about it.')),
+        completion(draft('Could you share a few details?')),
+      ]);
+      expect((await result()).reply).toBe('Could you share a few details?');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
+      expect(retryBody.messages[0].content).toContain('previous draft was rejected');
+      expect(retryBody.messages[0].content).toContain('commitment');
+    });
+    it('does not retry a clean draft', async () => {
+      const { fetchMock, result } = run([completion(draft('Hey! What\'s up?'))]);
+      await result();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it('tolerates a style-only issue on the final attempt but never a commitment', async () => {
+      const soft = run([completion(draft('How can I help you?')), completion(draft('What can I help you with?'))]);
+      expect((await soft.result()).reply).toBe('What can I help you with?');
+      expect(soft.fetchMock).toHaveBeenCalledTimes(2);
+      const hard = run([completion(draft('I\'m interested!')), completion(draft('Count me in!'))]);
+      await expect(hard.result()).rejects.toThrow('commitment');
+      expect(hard.fetchMock).toHaveBeenCalledTimes(2);
+    });
+    it('recovers once from invalid JSON, then gives up', async () => {
+      const recovered = run([completion('not json'), completion(draft('Hey!'))]);
+      expect((await recovered.result()).reply).toBe('Hey!');
+      const failing = run([completion('not json'), completion('still not json')]);
+      await expect(failing.result()).rejects.toThrow();
+      expect(failing.fetchMock).toHaveBeenCalledTimes(2);
+    });
+    it('does not retry transport failures, so outages stay fast', async () => {
+      const { fetchMock, result } = run([new Response('x', { status: 503 })]);
+      await expect(result()).rejects.toThrow('HTTP 503');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it('does not retry after the caller aborted', async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(completion('not json'));
+      vi.stubGlobal('fetch', fetchMock);
+      const controller = new AbortController();
+      const promise = generator().generate([syntheticMessage('m', 'hello')], controller.signal);
+      controller.abort();
+      await expect(promise).rejects.toThrow();
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(1);
+    });
   });
   it('rejects a missing OpenAI key before making requests', () => {
     expect(() => new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true' }),

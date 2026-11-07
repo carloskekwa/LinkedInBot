@@ -214,9 +214,27 @@ The LLM has no browser tools. One JSON call performs intent/language/reply gener
 Context is bounded by `CONTEXT_MESSAGES` and `MAX_INPUT_CHARS`; truncation/omission
 is explicitly labeled so the model can request missing details rather than invent them.
 The guard enforces length, basic disclosure checks, valid schema and no novel URLs.
-It is **not** a complete defense against prompt injection, misinformation or
+
+**Voice.** [prompts/system.md](prompts/system.md) asks for short, mirrored,
+conversational replies (language, formality and length follow the sender) and bans
+support-bot phrasing. Tested with the real model on synthetic messages: "hi" now gets
+"Hey! What's up?" rather than "How can I assist you today?". The prompt forbids
+inventing facts about the owner (job, employer, availability) and expressing interest or
+agreeing to anything on their behalf, because a reply speaks for a real person. It stays
+honest about automation: asked sincerely whether it is a bot, it says so briefly. Natural
+tone does not require pretending to be human. `LLM_TEMPERATURE` (default 0.8) controls
+wording variety.
+
+**Rewrite check.** Prompts cannot guarantee compliance, so code checks each draft. A
+draft that states interest or a commitment for the owner ("I'd love to…", "I'm
+interested", "count me in") or uses support-bot phrasing triggers **one** rewrite request
+(about one extra second, only when needed). A commitment that survives the rewrite is
+never sent; the fallback is used instead. Style-only issues are tolerated on the second
+try. Invalid JSON also gets one rewrite. Transport failures are not retried.
+These checks are phrase lists and will miss paraphrases; they reduce, not eliminate,
+the risk. It is **not** a complete defense against prompt injection, misinformation or
 multilingual policy violations. Review model quality before unattended use.
-On model errors, an explicit automated-assistant fallback is sent; it does not
+On model errors, an explicit automated fallback is sent (`FALLBACK_REPLY`); it does not
 promise that the owner will follow up. Appropriate no-reply decisions prevent loops.
 No fallback is sent when doing so would violate Stop, authentication, action caps
 or unresolved-outcome safety.
@@ -335,7 +353,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **85 tests in 4 files** passed;
+`npm run typecheck` and `npm run build` passed; all **92 tests in 4 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.
