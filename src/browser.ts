@@ -7,11 +7,17 @@ import { hash, messageId, parseReceipt, unknownReceipt } from './time.js';
 import type { Invitation, LinkedInPort, Message, Thread, Verification } from './types.js';
 
 const origin = 'https://www.linkedin.com';
+const invitationsUrl = `${origin}/mynetwork/invitation-manager/received/?invitationType=CONNECTION`;
 export function profileUrl(raw: string): string {
-  const url = new URL(raw, origin);
-  if (url.origin !== origin || !url.pathname.startsWith('/in/')) {
-    throw new Error('Unexpected profile link; refusing navigation');
-  }
+  const result = tryProfileUrl(raw);
+  if (!result) throw new Error('Unexpected profile link; refusing navigation');
+  return result;
+}
+// Null for anything that is not a personal profile (company/school pages, external links).
+export function tryProfileUrl(raw: string): string | null {
+  let url: URL;
+  try { url = new URL(raw, origin); } catch { return null; }
+  if (url.origin !== origin || !url.pathname.startsWith('/in/')) return null;
   return `${origin}${url.pathname.replace(/\/+$/, '')}/`;
 }
 function threadUrl(raw: string): string {
@@ -27,13 +33,25 @@ async function optionalText(locator: Locator): Promise<string> {
 export class PlaywrightAdapter implements LinkedInPort {
   private owner = '';
   private readonly selectors: Selectors;
+  private readonly configuredOwner: string;
   private openThread = '';
   private lastInvitationRefresh = 0;
   private lastMessageRefresh = 0;
+  private readonly threadLimit: number;
+  // In-memory only: participant-name hash -> thread URL, preview fingerprints, change times.
+  private readonly knownThreads = new Map<string, string>();
+  private readonly fingerprints = new Map<string, string>();
+  private readonly changedAt = new Map<string, number>();
+  // Alternative URL forms of the owner's own profile link, learned from one-to-one threads.
+  private readonly ownerAliases = new Set<string>();
   constructor(
     private context: BrowserContext, private invitationsPage: Page,
     private messagesPage: Page, config: Config, private log: Logger,
-  ) { this.selectors = loadSelectors(config.SELECTORS_FILE); }
+  ) {
+    this.selectors = loadSelectors(config.SELECTORS_FILE);
+    this.configuredOwner = config.OWNER_PROFILE_URL;
+    this.threadLimit = config.THREAD_LIMIT;
+  }
 
   static async open(config: Config, log: Logger): Promise<PlaywrightAdapter> {
     const context = await chromium.launchPersistentContext(config.BROWSER_PROFILE, {
@@ -92,15 +110,23 @@ export class PlaywrightAdapter implements LinkedInPort {
     return authenticated.some(Boolean);
   }
   async initialize(): Promise<void> {
-    const owner = this.messagesPage.locator(this.selectors.ownerProfile).first();
-    if (!await owner.count()) {
-      await this.messagesPage.locator(this.selectors.me).first().click();
+    if (this.configuredOwner) {
+      this.owner = profileUrl(this.configuredOwner);
+      this.log.info('Using explicitly configured owner profile; verify it belongs to the logged-in account');
+    } else {
+      const owner = this.messagesPage.locator(this.selectors.ownerProfile).first();
+      if (!await owner.count()) {
+        const me = this.messagesPage.locator(this.selectors.me).filter({ visible: true }).first();
+        if (!await me.count()) {
+          throw new Error('Owner menu not found. Set OWNER_PROFILE_URL to your own LinkedIn profile URL in .env');
+        }
+        await me.click();
+      }
+      const href = await owner.getAttribute('href');
+      if (!href) throw new Error('Cannot capture owner identity; set OWNER_PROFILE_URL or update ownerProfile selector');
+      this.owner = profileUrl(href);
     }
-    const href = await owner.getAttribute('href');
-    if (!href) throw new Error('Cannot capture owner profile identity; update ownerProfile selector');
-    this.owner = profileUrl(href);
-    await this.invitationsPage.goto(`${origin}/mynetwork/invitation-manager/`,
-      { waitUntil: 'domcontentloaded' });
+    await this.invitationsPage.goto(invitationsUrl, { waitUntil: 'domcontentloaded' });
     await this.messagesPage.goto(`${origin}/messaging/`, { waitUntil: 'domcontentloaded' });
     await this.healthCheck();
   }
@@ -110,45 +136,59 @@ export class PlaywrightAdapter implements LinkedInPort {
   }
   async healthCheck(): Promise<void> {
     await this.messagesPage.locator(this.selectors.conversationList).first().waitFor();
-    await this.invitationsPage.locator(
-      `${this.selectors.invitationList}, ${this.selectors.invitationsEmpty}`,
-    ).first().waitFor();
+    await this.invitationsPage.locator('main').first().waitFor();
     this.log.info('Startup list selectors verified. Per-thread/write selectors still need live validation.');
   }
   private async ensureInvitationList(): Promise<void> {
     if (!this.invitationsPage.url().includes('/invitation-manager')) {
-      await this.invitationsPage.goto(`${origin}/mynetwork/invitation-manager/`,
-        { waitUntil: 'domcontentloaded' });
+      await this.invitationsPage.goto(invitationsUrl, { waitUntil: 'domcontentloaded' });
     } else if (Date.now() - this.lastInvitationRefresh > 60_000) {
       // A parked page is not guaranteed to receive invitations live.
       await this.invitationsPage.reload({ waitUntil: 'domcontentloaded' });
       this.lastInvitationRefresh = Date.now();
     }
-    await this.invitationsPage.locator(
-      `${this.selectors.invitationList}, ${this.selectors.invitationsEmpty}`,
-    ).first().waitFor();
+    await this.invitationsPage.locator('main').first().waitFor();
+    await this.invitationsPage.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => undefined);
+  }
+  // Connection requests only. Page-follow and newsletter invitations share the same
+  // list; their Accept labels read "<Page> invitation for <Person>" / "invitation for <Newsletter>".
+  private async connectionCards(): Promise<{ card: Locator; id: string }[]> {
+    const results: { card: Locator; id: string }[] = [];
+    let skipped = 0;
+    for (const card of await this.invitationsPage.locator(this.selectors.invitationCard).all()) {
+      const accept = card.locator(this.selectors.invitationAccept).first();
+      if (!await accept.count()) continue;
+      const label = (await accept.getAttribute('aria-label')) ?? await optionalText(accept);
+      const profile = card.locator(this.selectors.invitationProfile).first();
+      const href = await profile.count() ? await profile.getAttribute('href') : null;
+      if (!href || /\binvitation for\b/i.test(label) || !/\binvitation\b/i.test(label)) { skipped++; continue; }
+      results.push({ card, id: profileUrl(href) });
+    }
+    if (skipped) this.log.debug({ skipped }, 'Skipped non-connection invitations (pages/newsletters)');
+    return results;
   }
   async invitations(): Promise<Invitation[]> {
     await this.ensureInvitationList();
-    const cards = this.invitationsPage.locator(this.selectors.invitationCard);
     const results: Invitation[] = [];
-    for (const card of await cards.all()) {
-      const href = await card.locator(this.selectors.invitationProfile).first().getAttribute('href');
-      if (!href) throw new Error('Invitation has no profile identifier');
+    for (const { card, id } of await this.connectionCards()) {
       const time = card.locator(this.selectors.invitationTime);
-      const rawTime = await time.count()
+      let rawTime = await time.count()
         ? await time.first().getAttribute('datetime') ?? await optionalText(time) : null;
-      results.push({ id: profileUrl(href), receipt: parseReceipt(rawTime, Date.now()) });
+      if (!rawTime) {
+        // Card text is parsed for a relative age only; it is not stored.
+        rawTime = /\b(\d+)\s*(second|minute|hour|day|week)s?\s+ago\b/i
+          .exec(await card.innerText())?.[0] ?? null;
+      }
+      results.push({ id, receipt: parseReceipt(rawTime, Date.now()) });
     }
     return results;
   }
   async accept(id: string, beforeClick: () => void): Promise<void> {
     await this.ensureInvitationList();
     if (!await this.authenticated()) throw new Error('Authentication required');
-    for (const card of await this.invitationsPage.locator(this.selectors.invitationCard).all()) {
-      const href = await card.locator(this.selectors.invitationProfile).first().getAttribute('href');
-      if (href && profileUrl(href) === id) {
-        const accept = card.locator(this.selectors.invitationAccept).first();
+    for (const entry of await this.connectionCards()) {
+      if (entry.id === id) {
+        const accept = entry.card.locator(this.selectors.invitationAccept).first();
         await accept.waitFor();
         beforeClick();
         await accept.click();
@@ -179,12 +219,50 @@ export class PlaywrightAdapter implements LinkedInPort {
     }
     await this.messagesPage.locator(this.selectors.conversationList).first().waitFor();
     const links = await this.messagesPage.locator(this.selectors.conversationLink).all();
-    const result = new Set<string>();
-    for (const link of links) {
-      const href = await link.getAttribute('href');
-      if (href) result.add(threadUrl(href));
+    if (links.length) {
+      const result = new Set<string>();
+      for (const link of links) {
+        const href = await link.getAttribute('href');
+        if (href) result.add(threadUrl(href));
+      }
+      return [...result];
     }
-    return [...result];
+    return this.discoverConversations();
+  }
+  // Current UI renders conversation cards without links. A card's thread URL is learned
+  // by clicking it once; afterwards only cards whose preview changed are reported.
+  private async discoverConversations(): Promise<string[]> {
+    const now = Date.now();
+    const items = await this.messagesPage.locator(this.selectors.conversationItem).all();
+    for (const item of items.slice(0, this.threadLimit)) {
+      if (await item.locator(this.selectors.conversationSponsored).count()) continue;
+      const names = await optionalText(item.locator(this.selectors.conversationNames));
+      if (!names) continue;
+      const key = hash(names);
+      const fingerprint = hash(JSON.stringify([names,
+        await optionalText(item.locator(this.selectors.conversationSnippet)),
+        await optionalText(item.locator(this.selectors.conversationTime))]));
+      let id = this.knownThreads.get(key);
+      if (!id) {
+        if (await item.locator(this.selectors.conversationActive).count()) {
+          id = threadUrl(this.messagesPage.url());
+        } else {
+          const previous = this.messagesPage.url();
+          await item.locator(this.selectors.conversationItemLink).first().click();
+          await this.messagesPage.waitForURL(url =>
+            url.href !== previous && url.pathname.startsWith('/messaging/thread/'));
+          id = threadUrl(this.messagesPage.url());
+        }
+        this.openThread = id;
+        this.knownThreads.set(key, id);
+      }
+      if (this.fingerprints.get(key) !== fingerprint) {
+        this.fingerprints.set(key, fingerprint);
+        this.changedAt.set(id, now);
+      }
+    }
+    return [...this.changedAt.entries()]
+      .filter(([, at]) => now - at < 120_000).map(([id]) => id);
   }
   private async openConversation(id: string): Promise<void> {
     const safe = threadUrl(id);
@@ -199,17 +277,22 @@ export class PlaywrightAdapter implements LinkedInPort {
     await this.openConversation(id);
     const recipients = this.messagesPage.locator(this.selectors.recipient);
     const recipientLinks = new Set<string>();
+    let nonPersonRecipient = false;
     for (const recipient of await recipients.all()) {
       const href = await recipient.getAttribute('href');
-      if (href) recipientLinks.add(profileUrl(href));
+      if (!href) continue;
+      const profile = tryProfileUrl(href);
+      if (profile) recipientLinks.add(profile); else nonPersonRecipient = true;
     }
-    const supported = recipientLinks.size === 1 &&
+    const supported = recipientLinks.size === 1 && !nonPersonRecipient &&
       !await this.messagesPage.locator(this.selectors.unsupported).count();
     if (!supported) {
-      this.log.warn({ ref: hash(id) }, 'Unsupported or unidentified thread; skipped (check recipient selectors)');
+      this.log.warn({ ref: hash(id), recipients: recipientLinks.size, nonPersonRecipient },
+        'Unsupported or unidentified thread (group/Page/InMail?); skipped');
       return { id, messages: [], supported: false };
     }
-    const events = await this.messagesPage.locator(this.selectors.message).all();
+    let events = await this.messagesPage.locator(this.selectors.message).all();
+    if (!events.length) events = await this.messagesPage.locator(this.selectors.messageLegacy).all();
     const messages: Message[] = [];
     let sender: string | null = null;
     const occurrences = new Map<string, number>();
@@ -219,20 +302,47 @@ export class PlaywrightAdapter implements LinkedInPort {
       if (!await event.locator(this.selectors.messageText).count() && !attachment) continue;
       const senderLink = event.locator(this.selectors.messageSender).first();
       const href = await senderLink.count() ? await senderLink.getAttribute('href') : null;
-      if (href) sender = profileUrl(href);
-      const ownMarker = await event.evaluate((element, selector) => element.matches(selector),
-        this.selectors.messageOwn);
-      if (ownMarker) sender = this.owner;
-      if (!sender) throw new Error('Message sender cannot be established; refusing automatic reply');
-      if (sender !== this.owner && !recipientLinks.has(sender)) {
-        throw new Error('Unexpected sender in one-to-one thread; refusing automatic reply');
+      if (href) {
+        const profile = tryProfileUrl(href);
+        if (!profile) {
+          // A Page/organisation sender is never the owner and is out of scope for replies.
+          this.log.warn({ ref: hash(id) }, 'Non-person sender in thread; skipped as unsupported');
+          return { id, messages: [], supported: false };
+        }
+        sender = profile;
       }
-      const own = sender === this.owner;
+      const [ownMarker, incomingMarker] = await event.evaluate((element, s) => [
+        element.matches(s.own), element.matches(s.incoming),
+      ], { own: this.selectors.messageOwn, incoming: this.selectors.messageIncoming });
+      // Classification must be unambiguous; otherwise refuse to act on the thread.
+      // In a verified one-to-one thread, a linked sender that is not the recipient can
+      // only be the owner (LinkedIn may render the owner's link in a different URL form).
+      const isRecipient = sender !== null && recipientLinks.has(sender);
+      const ownByElimination = !incomingMarker && sender !== null && !isRecipient &&
+        recipientLinks.size === 1;
+      const own = ownMarker || (!incomingMarker && (sender === this.owner ||
+        (sender !== null && this.ownerAliases.has(sender)) || ownByElimination));
+      const incoming = incomingMarker || (!ownMarker && isRecipient);
+      if (incomingMarker && sender !== null && this.ownerAliases.has(sender)) {
+        throw new Error('Message sender cannot be classified; owner alias contradicted by incoming marker');
+      }
+      if (own === incoming) {
+        // Boolean signals only; no content or identifiers.
+        throw new Error('Message sender cannot be classified; refusing automatic reply ' +
+          `[href=${href !== null} matchesOwner=${sender === this.owner} ownMarker=${ownMarker} ` +
+          `incomingMarker=${incomingMarker} matchesRecipient=${isRecipient}]`);
+      }
+      if (own && sender !== null && sender !== this.owner && !this.ownerAliases.has(sender)) {
+        this.ownerAliases.add(sender);
+        this.log.info({ ref: hash(id), idForm: /\/in\/ACo/i.test(sender) ? 'member-id' : 'other' },
+          'Owner profile link form differs from OWNER_PROFILE_URL; alias learned from one-to-one thread');
+      }
+      if (own) sender = this.owner;
       const time = event.locator(this.selectors.messageTime).first();
       const absoluteTime = await time.count() ? await time.getAttribute('datetime') : null;
       const raw = absoluteTime ?? (await time.count() ? await time.innerText() : null);
       const stableId = await event.getAttribute('data-event-urn') ?? await event.getAttribute('data-message-id');
-      const occurrenceKey = hash(JSON.stringify([sender, text, absoluteTime]));
+      const occurrenceKey = hash(JSON.stringify([own, text, absoluteTime]));
       const occurrence = occurrences.get(occurrenceKey) ?? 0;
       occurrences.set(occurrenceKey, occurrence + 1);
       if (!stableId && !absoluteTime) this.log.debug({ ref: hash(id) },
@@ -259,7 +369,7 @@ export class PlaywrightAdapter implements LinkedInPort {
     const send = this.messagesPage.locator(this.selectors.send).first();
     try {
       await composer.fill(text);
-      await send.waitFor();
+      await send.waitFor({ timeout: 5_000 });
       if (!await send.isEnabled()) throw new Error('Send button disabled');
       beforeClick();
       await send.click();

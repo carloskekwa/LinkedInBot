@@ -5,10 +5,10 @@ Chromium profile, two worker pages, SQLite and an OpenAI-compatible model endpoi
 No Docker, dashboard, cloud deployment, stealth plugins or credential collection.
 
 **Status:** implemented and tested with synthetic data and local browser fixtures.
-The selectors have **not** been validated against an authenticated LinkedIn account.
-No live acceptance/send, real-model quality assessment or one-hour live soak has
-been performed. Do not submit this as live-verified without completing the checklist
-below. A browser fixture passing is not evidence that LinkedIn's current UI matches it.
+Read-only selectors were partially validated against an authenticated account on
+7 Nov 2026 (see "Live validation so far" below). **No live acceptance or send has been
+performed**, nor a real-model quality assessment or one-hour soak. Do not submit this
+as live-verified without completing the checklist below.
 
 ## Platform-policy risk
 
@@ -51,6 +51,13 @@ to OpenAI**. Review the provider's retention policy before use. Without an expli
 keys fail before the bot opens its browser; login/smoke do not require a model key.
 Never paste a real key into chat, documentation or Git.
 
+Set `OWNER_PROFILE_URL` in your private `.env` to **your own logged-in account's**
+full profile URL, e.g. `https://www.linkedin.com/in/your-profile-slug/`. This bypasses
+the UI-dependent owner-menu lookup, not authentication. The application validates
+the URL shape but cannot independently prove it belongs to the session; you must
+provide the correct account. An incorrect value can break own-message classification.
+Leaving it empty uses legacy owner-menu detection and fails explicitly if unavailable.
+
 Alternative OpenAI-compatible providers remain supported through the same variables.
 For local inference, explicitly set a local endpoint and model and set
 `ALLOW_EXTERNAL_LLM=false`; a local server is not bundled.
@@ -58,9 +65,17 @@ Redirects are disabled to avoid forwarding credentials to a different endpoint.
 
 ```sh
 npm run login          # manual login; exits after saving the local profile
+npm run inspect:live   # read-only structural DOM census -> data/dom-inspection.json
 npm run smoke:live     # read-only selector/thread check; prints counts, not bodies
 npm run start:dry      # reads/generates but never accepts or sends
 ```
+
+`inspect:live` records tag/class/role/attribute *names* only, redacting profile and
+thread slugs — but button `aria-label`s on the invitation page contain inviter names.
+The file is gitignored; delete it when done. **Do not run inspect/smoke repeatedly:**
+each run performs dozens of page loads, and LinkedIn responded with HTTP errors
+(`net::ERR_HTTP_RESPONSE_CODE_FAILURE`) after roughly six runs within ten minutes.
+Wait 10–15 minutes if that happens.
 
 The login command automatically closes Chromium once authenticated. Do not interrupt
 it prematurely. Dry-run still reads private messages and contacts the configured
@@ -285,10 +300,33 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **61 tests in 3 files** passed;
+`npm run typecheck` and `npm run build` passed; all **71 tests in 3 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.
+
+### Live validation so far (read-only, 7 Nov 2026)
+
+Observed against the owner's authenticated account with `inspect:live`/`smoke:live`:
+
+- Login detection, owner identity (`OWNER_PROFILE_URL`) and both list pages load.
+- `/messaging/` auto-opens a thread; conversation cards have **no links**, so thread
+  URLs are learned by clicking each card once (startup only), then change detection
+  uses an in-memory preview fingerprint. 12 threads were discovered this way.
+- Messages carry stable `data-event-urn` IDs; incoming ones carry
+  `msg-s-event-listitem--other`; the owner's own link uses the member-ID URL form, so
+  own/incoming classification uses marker + recipient + one-to-one elimination.
+  4 one-to-one threads (23 messages, 10 own / 13 incoming) classified without error.
+  Threads with Page/organisation recipients are skipped as unsupported.
+- No `<time datetime>` attributes exist: message receipt times are **unknown**;
+  invitation ages are parsed from relative text ("2 hours ago") when present.
+- The invitation manager mixes connection requests with **Page-follow and newsletter
+  invitations**. Only cards with a `/in/` profile link whose Accept label is not of the
+  form "… invitation for …" are treated as connection requests. The account had **zero
+  pending person requests** during validation, so **the person-card label format and the
+  Accept click are still unverified live**.
+- The Send button only renders once the composer has content; it has **not** been
+  clicked live. Acceptance verification via the profile "More actions" menu is unverified.
 
 ```sh
 npm run typecheck
@@ -348,7 +386,8 @@ linguistic quality or injection resistance. CI installs Chromium before running 
   redirected tabs once at least one tab is authenticated.
 - Logged in but stuck at "Log in manually": monitoring has not started. Login
   detection accepts visible legacy navigation or a navigation region containing
-  both Feed and Messaging links. Every 30 seconds it logs sanitized page state and
+  a Messaging link; the Feed link need not be inside that region. LinkedIn origin
+  and login/checkpoint URL checks still apply. Every 30 seconds it logs sanitized page state and
   selector counts. If those remain absent, update the `nav` selector after inspecting
   the actual UI; do not bypass the authentication check.
 - Uncertain action: inspect manually; no blind retry or database reset.

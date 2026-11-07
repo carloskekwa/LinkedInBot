@@ -9,6 +9,7 @@ import { Bot } from './runtime.js';
 import { acquireLock } from './lock.js';
 import { report } from './metrics.js';
 import { demo } from './demo.js';
+import { inspectLive } from './inspect.js';
 
 const controller = new AbortController();
 process.once('SIGINT', () => controller.abort());
@@ -20,10 +21,10 @@ async function main(): Promise<void> {
   if (existsSync('.env')) process.loadEnvFile('.env');
   const args = process.argv.slice(2);
   if (args.includes('--help')) {
-    console.log('Usage: npm start -- [--dry-run | --live | --login | --smoke | --demo | --report]');
+    console.log('Usage: npm start -- [--dry-run | --live | --login | --smoke | --inspect | --demo | --report]');
     return;
   }
-  const valid = ['--dry-run', '--live', '--login', '--smoke', '--demo', '--report'];
+  const valid = ['--dry-run', '--live', '--login', '--smoke', '--inspect', '--demo', '--report'];
   if (args.length > 1 || args.some(arg => !valid.includes(arg))) {
     throw new Error('Choose exactly one documented CLI mode; use --help');
   }
@@ -49,7 +50,7 @@ async function main(): Promise<void> {
   if (live && !config.ACKNOWLEDGE_PLATFORM_RISK) {
     throw new Error('Live mode requires ACKNOWLEDGE_PLATFORM_RISK=true; read README first');
   }
-  const generator = args[0] === '--login' || args[0] === '--smoke'
+  const generator = ['--login', '--smoke', '--inspect'].includes(args[0]!)
     ? undefined : new LlmGenerator(config, loadPrompt(config), log);
   mkdirSync(resolve(config.BROWSER_PROFILE), { recursive: true, mode: 0o700 });
   chmodSync(resolve(config.BROWSER_PROFILE), 0o700);
@@ -57,6 +58,10 @@ async function main(): Promise<void> {
   let adapter: PlaywrightAdapter | undefined;
   let store: Store | undefined;
   try {
+    if (args[0] === '--inspect') {
+      await inspectLive(config, log, controller.signal);
+      return;
+    }
     adapter = await PlaywrightAdapter.open(config, log);
     await adapter.login(controller.signal);
     if (args[0] === '--login') {
@@ -67,15 +72,26 @@ async function main(): Promise<void> {
     if (args[0] === '--smoke') {
       const invitations = await adapter.invitations();
       const threads = await adapter.conversations();
-      let supportedThreads = 0, messages = 0, exactReceipts = 0;
+      let supportedThreads = 0, messages = 0, ownMessages = 0, exactReceipts = 0, classificationFailures = 0;
       for (const id of threads.slice(0, config.THREAD_LIMIT)) {
-        const thread = await adapter.thread(id);
-        supportedThreads += Number(thread.supported);
-        messages += thread.messages.length;
-        exactReceipts += thread.messages.filter(m => m.receipt.precision === 'exact').length;
+        try {
+          const thread = await adapter.thread(id);
+          supportedThreads += Number(thread.supported);
+          messages += thread.messages.length;
+          ownMessages += thread.messages.filter(m => m.own).length;
+          exactReceipts += thread.messages.filter(m => m.receipt.precision === 'exact').length;
+        } catch (error) {
+          classificationFailures++;
+          const message = error instanceof Error ? error.message : '';
+          log.warn({ errorType: error instanceof Error ? error.name : 'unknown',
+            // Only static diagnostics are logged; anything containing URLs/paths is withheld.
+            detail: message && !/[/\\]|https?:/i.test(message) ? message.slice(0, 200) : undefined },
+            'Thread could not be read/classified; the bot would skip it');
+        }
       }
-      log.info({ invitations: invitations.length, threads: threads.length,
-        supportedThreads, messages, exactReceipts },
+      log.info({ connectionInvitations: invitations.length, threads: threads.length,
+        supportedThreads, messages, ownMessages, incomingMessages: messages - ownMessages,
+        exactReceipts, classificationFailures },
         'Read-only smoke completed. No acceptance or send was attempted');
       return;
     }
@@ -99,11 +115,18 @@ main().catch(error => {
   if (controller.signal.aborted) { log.info('Stopped; unfinished actions will be reconciled on restart'); return; }
   // Do not log arbitrary exception objects: HTTP/browser errors may contain private data.
   const safe = error instanceof Error ? error.name : 'unknown';
-  log.error({ errorType: safe }, 'Startup/runtime failed. Check config, browser install, selectors and README');
+  const message = error instanceof Error ? error.message : '';
+  if (/ERR_HTTP_RESPONSE_CODE_FAILURE|ERR_TOO_MANY_REDIRECTS|net::ERR_/.test(message)) {
+    log.error({ errorType: safe, networkError: /net::[A-Z_]+/.exec(message)?.[0] },
+      'LinkedIn returned an HTTP error. This is often temporary rate limiting after many ' +
+      'page loads. Do NOT retry in a loop; wait 10-15 minutes and avoid repeated smoke/inspect runs');
+  } else {
+    log.error({ errorType: safe }, 'Startup/runtime failed. Check config, browser install, selectors and README');
+  }
   if (error instanceof Error && error.name === 'ZodError') {
     console.error('Configuration or data validation failed; check documented field types and consent flags.');
-  } else if (error instanceof Error && !/https?:|Bearer|cookie|token|password|api.?key/i.test(error.message)) {
-    console.error(error.message);
+  } else if (message && !/https?:|Bearer|cookie|token|password|api.?key|\/in\//i.test(message)) {
+    console.error(message);
   }
   process.exitCode = 1;
 });

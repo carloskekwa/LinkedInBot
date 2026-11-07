@@ -7,6 +7,15 @@ import { syntheticMessage } from '../src/demo.js';
 afterEach(() => vi.unstubAllGlobals());
 const valid = { should_reply: true, reply: 'Hello!', language: 'en', reason: 'greeting' };
 describe('configuration and LLM contract', () => {
+  it('validates explicit owner identity as a LinkedIn profile URL', () => {
+    const env = { ALLOW_EXTERNAL_LLM: 'true' };
+    expect(loadConfig({ ...env, OWNER_PROFILE_URL: 'https://www.linkedin.com/in/synthetic-owner/' })
+      .OWNER_PROFILE_URL).toBe('https://www.linkedin.com/in/synthetic-owner/');
+    for (const url of ['https://example.invalid/in/owner/', 'https://www.linkedin.com/feed/',
+      'https://www.linkedin.com/in/', 'not a URL']) {
+      expect(() => loadConfig({ ...env, OWNER_PROFILE_URL: url })).toThrow();
+    }
+  });
   it('requires explicit external-provider privacy consent and HTTPS', () => {
     expect(() => loadConfig({ LLM_BASE_URL: 'https://example.invalid/v1' })).toThrow();
     expect(() => loadConfig({ LLM_BASE_URL: 'http://example.invalid/v1',

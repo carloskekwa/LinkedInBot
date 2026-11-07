@@ -8,6 +8,14 @@ const schema = z.object({
   ACKNOWLEDGE_PLATFORM_RISK: bool.default(false),
   DATA_DIR: z.string().default('./data'),
   BROWSER_PROFILE: z.string().default('./user-data'),
+  OWNER_PROFILE_URL: z.string().trim().default('').refine(value => {
+    if (!value) return true;
+    try {
+      const url = new URL(value);
+      return url.origin === 'https://www.linkedin.com' &&
+        /^\/in\/[^/]+\/?$/.test(url.pathname) && !url.username && !url.password;
+    } catch { return false; }
+  }, 'OWNER_PROFILE_URL must be your https://www.linkedin.com/in/... profile URL'),
   INVITATION_POLL_MS: positive(20_000),
   MESSAGE_POLL_MS: positive(10_000),
   DEBOUNCE_MS: positive(7_000),
