@@ -240,14 +240,28 @@ invented a location, an employer-style claim, "10 years of experience" and "I do
 with React Native" when it had no facts. So code checks every draft for: (1) interest,
 availability or commitments made for the owner ("I'd love to…", "I'm interested", "not
 at the moment", "count me in"); (2) first-person claims about the owner (where they are
-based or work, what they do or don't do, years of experience, what their profile says)
-that are not supported by the owner facts (questions are never treated as claims); and
-(3) support-bot phrasing. Any hit triggers **one** rewrite request (about one extra
-second, only when needed). If an unsupported claim or commitment survives the rewrite,
-an English conversation gets a short neutral line ("It's on my profile if you want to
-take a look." / "Could you share a few more details?") and other languages get the
-`FALLBACK_REPLY`. Style-only issues are tolerated on the second try. Invalid JSON also
-gets one rewrite. Transport failures are not retried.
+based or work, what they do, years of experience, what their profile says)
+that are not supported by the owner facts (questions are never treated as claims), and
+denials of experience or knowledge ("I don't have experience with X"), which are always
+rejected because a facts list can support a "yes" but never a "no"; and
+(3) support-bot phrasing and the stock "What about you?" follow-up, which assumes the
+sender's background. Openness, interests or availability are never stated for the owner,
+even if your facts mention them: opportunity, job, consulting and meeting questions get a
+request for details and the decision stays with you. Any hit triggers **one** rewrite request (about one extra
+second, only when needed). The model receives the latest incoming message explicitly,
+with earlier messages labeled as background and owner facts restricted to relevant asks.
+Recognized plain English greetings, wellbeing questions, thanks and closings must not
+get owner facts or a profile referral. Persistent hard violations get a short contextual
+substitute (for example "Hey!" or "Thanks for asking! How's your day going?"), without
+inventing the owner's feelings or day. This small-talk check uses narrow English patterns;
+it does not cover every phrasing or language.
+Persistent commitments in other English messages get "Could you share a few more details?".
+Other persistent unsupported claims and non-English hard violations use the explicit
+automated `FALLBACK_REPLY`, rather than an unrelated profile referral. Style-only issues
+are tolerated on the second try. Invalid JSON also gets one rewrite. Transport failures
+are not retried. Rejection logs identify the rule; with `LOG_MESSAGE_TEXT=true`, an
+additional `Rejected AI draft` log shows each rejected content-rule draft. These drafts
+may contain private conversation text or inaccurate claims; redact them before sharing.
 Measured with the real model on 48 synthetic questions designed to provoke invented
 facts: 0 unsupported claims reached the output after the checks, 0 generic fallbacks,
 about 40% of drafts needed a rewrite. These checks are phrase patterns and will miss

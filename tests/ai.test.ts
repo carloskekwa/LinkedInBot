@@ -122,12 +122,12 @@ describe('configuration and LLM contract', () => {
     const draft = (reply: string) => JSON.stringify({ ...valid, reply });
     const generator = () => new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
       LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }));
-    const run = (responses: Response[]) => {
+    const run = (responses: Response[], incoming = 'hello') => {
       const fetchMock = vi.fn<typeof fetch>();
       for (const response of responses) fetchMock.mockResolvedValueOnce(response);
       vi.stubGlobal('fetch', fetchMock);
       return { fetchMock, result: () => generator().generate(
-        [syntheticMessage('m', 'hello')], new AbortController().signal) };
+        [syntheticMessage('m', incoming)], new AbortController().signal) };
     };
 
     it('flags commitments and support-bot phrasing, including curly apostrophes', () => {
@@ -194,17 +194,200 @@ describe('configuration and LLM contract', () => {
       const { fetchMock, result } = run([
         completion(draft('I\'m based in London. What about you?')),
         completion(draft('It\'s on my profile if you want to take a look.')),
-      ]);
+      ], 'Where are you based?');
       expect((await result()).reply).toBe('It\'s on my profile if you want to take a look.');
       const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
       expect(retryBody.messages[0].content).toContain('not in the approved facts');
     });
-    it('never sends an invented fact: persistent claims get a neutral English line', async () => {
+    it('rejects denials of experience in every phrasing, even when facts are listed', () => {
+      const facts = ['I work as a mobile engineer using Swift, Java and Spring Boot.'];
+      for (const text of ['I don\'t have experience with Golang specifically.', 'I haven\'t used Go.',
+        'I\'ve never worked with Go.', 'I\'m not familiar with Go.', 'I have no experience with Go.',
+        'I have little experience with Go.', 'I don\u2019t know Go.', 'I haven\'t touched Rust.',
+        'I do not have any experience with Kotlin.', 'I\'m not experienced in Go.',
+        'I don\'t have experience with Golang specifically, but I focus more on mobile development.']) {
+        expect(reviewReply(text, facts), text).toMatchObject({ hard: true, rule: 'owner-claim' });
+      }
+      for (const text of ['I don\'t know what you mean.', 'I can\'t open links from here.',
+        'I haven\'t seen the attachment.', 'My main stack is Swift and Java on the backend.']) {
+        expect(reviewReply(text, facts), text).toBeNull();
+      }
+    });
+    it('treats the stock "What about you?" follow-up as a soft style issue', () => {
+      for (const text of ['Nice to meet you! What about you?', 'Good, and you?', 'How about yourself?']) {
+        expect(reviewReply(text), text).toMatchObject({ hard: false, rule: 'support-bot-style' });
+      }
+      expect(reviewReply('Sure. What are you working on?')).toBeNull();
+    });
+    it('rewrites the reported Golang denial into a neutral stack answer', async () => {
+      const fetchMock = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(completion(draft('I don\'t have experience with Golang specifically, but I focus ' +
+          'more on mobile development and Java. What about you?')))
+        .mockResolvedValueOnce(completion(draft('My main stack is mobile and Java. What are you working on?')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }),
+        ['I work on mobile development and Java backends.']);
+      const reply = await withFacts.generate([syntheticMessage('m', 'do u know golang techstack?')],
+        new AbortController().signal);
+      expect(reply.reply).toBe('My main stack is mobile and Java. What are you working on?');
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
+      expect(retryBody.messages[0].content).toContain('denied having experience');
+    });
+    it('never states openness from the facts: opportunity questions get a request for details', async () => {
+      const fetchMock = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(completion(draft('I\'m open to interesting opportunities. What did you have in mind?')))
+        .mockResolvedValueOnce(completion(draft('I\'m also open to technical collaborations.')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }),
+        ['I\'m also open to interesting technical collaborations and consulting opportunities.']);
+      const reply = await withFacts.generate([syntheticMessage('m', 'Are you open to new opportunities?')],
+        new AbortController().signal);
+      expect(reply.reply).toBe('Could you share a few more details?');
+    });
+    it('rejects persistent owner claims instead of substituting an unrelated profile referral', async () => {
       const { result } = run([completion(draft('I\'m based in London.')),
-        completion(draft('I live in Paris.'))]);
+        completion(draft('I live in Paris.'))], 'What did you think of that post?');
+      await expect(result()).rejects.toThrow('unsupported claim');
+    });
+    it.each([
+      ['hi', 'I\'m based in London.', 'I live in Paris.'],
+      [' hello! ', 'I\'m interested!', 'Count me in!'],
+      ['HEY', 'I live in London.', 'It\'s on my profile if you want to take a look.'],
+      ['good morning', 'It\'s on my profile.', 'It\'s on my profile.'],
+    ])('uses a greeting after two rejected drafts for %s', async (incoming, first, second) => {
+      const { fetchMock, result } = run([completion(draft(first)), completion(draft(second))], incoming);
       const reply = await result();
-      expect(reply.reply).toBe('It\'s on my profile if you want to take a look.');
+      expect(reply.reply).toBe('Hey!');
       expect(reply.reason).toContain('neutral substitute');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
+      expect(retryBody.messages[0].content).toContain('Answer only the latest incoming message');
+    });
+    it.each([
+      ['hi', 'Hey! Not much, just keeping busy. How about you?'],
+      ['hi', 'Hey! I\'m doing great, thanks.'],
+      ['how are you doing today?', 'Doing well, just a busy day. You?'],
+    ])('rejects an invented owner state or activity in reply to %s', async (incoming, invented) => {
+      const { fetchMock, result } = run([completion(draft(invented)), completion(draft('Hey!'))], incoming);
+      expect((await result()).reply).toBe('Hey!');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
+      expect(retryBody.messages[0].content).toContain('invented state');
+    });
+    it('falls back to a plain greeting when the rewrite still invents an activity', async () => {
+      const { result } = run([completion(draft('Hey! Not much, just keeping busy.')),
+        completion(draft('Hey! All good here.'))], 'hi');
+      expect((await result()).reply).toBe('Hey!');
+    });
+    it('does not apply the small-talk state check to substantive messages', async () => {
+      const { fetchMock, result } = run([completion(draft('Sounds busy! What did you want to go over?'))],
+        'quick question about your team');
+      expect((await result()).reply).toContain('busy');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it('rejects even supported owner facts when the latest message is just a greeting', async () => {
+      const fetchMock = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(completion(draft('I\'m based in Exampleville.')))
+        .mockResolvedValueOnce(completion(draft('Hey!')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }),
+        ['I am based in Exampleville.']);
+      const reply = await withFacts.generate([
+        syntheticMessage('old', 'Where are you based?'),
+        { ...syntheticMessage('owner', 'I am based in Exampleville.'), own: true },
+        syntheticMessage('new', 'hi'),
+      ], new AbortController().signal);
+      expect(reply.reply).toBe('Hey!');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+    it.each([
+      ['how are you doing today?', 'Thanks for asking! How\'s your day going?'],
+      ['Hey, how are you?', 'Thanks for asking! How\'s your day going?'],
+      ['How\u2019s your day going?', 'Thanks for asking! How\'s your day going?'],
+      ['thanks!', 'Anytime!'],
+      ['ok', 'Got it.'],
+      ['bye', 'Take care!'],
+    ])('blocks approved but irrelevant work facts for %s', async (incoming, expected) => {
+      const lines: string[] = [];
+      const logger = pino({ level: 'debug' }, { write: line => { lines.push(line); } });
+      const fetchMock = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(completion(draft('I work at Example Corp as a mobile engineer. What about you?')))
+        .mockResolvedValueOnce(completion(draft('It\'s on my profile if you want more details.')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', logger,
+        ['I work at Example Corp as a mobile engineer.']);
+      const reply = await withFacts.generate([
+        syntheticMessage('old', 'Where do you work?'),
+        { ...syntheticMessage('owner', 'I work at Example Corp as a mobile engineer.'), own: true },
+        syntheticMessage('new', incoming),
+      ], new AbortController().signal);
+      expect(reply.reply).toBe(expected);
+      expect(lines.join('')).toContain('"rule":"smalltalk-context"');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const call of fetchMock.mock.calls) {
+        const body = JSON.parse(String(call[1]!.body));
+        const data = JSON.parse(body.messages[1].content);
+        expect(data.latestIncomingMessage).toEqual({
+          sender: 'incoming', text: incoming, textTruncated: false, attachmentNotInspected: false,
+        });
+        expect(data.untrustedConversationData[0].text).toBe('Where do you work?');
+        expect(body.messages[0].content).toContain('ordered oldest to newest');
+      }
+    });
+    it('uses a natural rewrite for the reported wellbeing question', async () => {
+      const { fetchMock, result } = run([
+        completion(draft('I live in London.')),
+        completion(draft('Thanks for asking! How\'s your day going?')),
+      ], 'how are you doing today?');
+      expect((await result()).reply).toBe('Thanks for asking! How\'s your day going?');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+    it.each(['how are you doing today? Where do you work?', 'thanks, can we meet tomorrow?'])(
+      'does not classify a mixed substantive message as small talk: %s', async incoming => {
+        const { result } = run([completion(draft('I live in London.')),
+          completion(draft('I live in Paris.'))], incoming);
+        await expect(result()).rejects.toThrow('unsupported claim');
+      });
+    it.each(['hi, where do you work?', 'Please stop messaging me.', 'Are you a bot?'])(
+      'does not turn %s into a greeting after persistent owner claims', async incoming => {
+        const { result } = run([completion(draft('I live in London.')),
+          completion(draft('I live in Paris.'))], incoming);
+        await expect(result()).rejects.toThrow('unsupported claim');
+      });
+    it('does not use a greeting substitute for an attachment or an owner-authored last message', async () => {
+      for (const extra of [{ attachment: true }, { own: true }]) {
+        const { fetchMock } = run([completion(draft('I live in London.')),
+          completion(draft('I live in Paris.'))]);
+        await expect(generator().generate([{ ...syntheticMessage('m', 'hi'), ...extra }],
+          new AbortController().signal)).rejects.toThrow('unsupported claim');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      }
+    });
+    it.each(['false', 'true'])('logs rejection rules, with draft text opt-in=%s', async enabled => {
+      const lines: string[] = [];
+      const logger = pino({ level: 'debug' }, { write: line => { lines.push(line); } });
+      const { fetchMock } = run([completion(draft('I live in London.')),
+        completion(draft('I live in Paris.'))]);
+      const logged = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key', LOG_MESSAGE_TEXT: enabled }), 'test system', logger);
+      expect((await logged.generate([syntheticMessage('m', 'hi')],
+        new AbortController().signal)).reply).toBe('Hey!');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const output = lines.join('');
+      expect(output).toContain('"rule":"owner-claim"');
+      if (enabled === 'true') {
+        expect(output).toContain('"aiDraft":"I live in London."');
+        expect(output).toContain('"aiDraft":"I live in Paris."');
+        expect(output).toContain('"attempt":2');
+      } else {
+        expect(output).not.toContain('aiDraft');
+        expect(output).not.toContain('London');
+        expect(output).not.toContain('Paris');
+      }
     });
     it('uses the generic fallback (throws) when a persistent violation is not in English', async () => {
       const fr = (reply: string) => completion(JSON.stringify({ ...valid, language: 'fr', reply }));
@@ -241,7 +424,8 @@ describe('configuration and LLM contract', () => {
       const soft = run([completion(draft('How can I help you?')), completion(draft('What can I help you with?'))]);
       expect((await soft.result()).reply).toBe('What can I help you with?');
       expect(soft.fetchMock).toHaveBeenCalledTimes(2);
-      const hard = run([completion(draft('I\'m interested!')), completion(draft('Count me in!'))]);
+      const hard = run([completion(draft('I\'m interested!')), completion(draft('Count me in!'))],
+        'Can we have a call tomorrow?');
       const substituted = await hard.result();
       expect(substituted.reply).toBe('Could you share a few more details?');
       expect(hard.fetchMock).toHaveBeenCalledTimes(2);

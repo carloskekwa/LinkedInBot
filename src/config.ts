@@ -73,7 +73,9 @@ export function loadPrompt(config: Config): string {
   return `${base}\nFACTS ABOUT THE OWNER (approved by the owner; the ONLY personal facts you may state)\n` +
     'State them plainly in the first person when someone asks, for example "I work at ..." ' +
     'Use only what is written here and add no detail of your own. Anything about the owner that ' +
-    'is not listed here is unknown: follow the rule for unknown owner information above.\n' +
+    'is not listed here is unknown: follow the rule for unknown owner information above. ' +
+    'Lines about interests, goals, openness or availability are background only: never state them ' +
+    'in reply to job, opportunity, collaboration or meeting questions; ask for details instead.\n' +
     `${facts.map(fact => `- ${fact}`).join('\n')}\n`;
 }
 
