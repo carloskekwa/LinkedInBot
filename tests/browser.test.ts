@@ -63,6 +63,27 @@ async function adapter() {
   return { port, invitations, messages };
 }
 describe('live adapter against synthetic DOM (not live LinkedIn)', () => {
+  it('finishes login on navigation without legacy LinkedIn classes', async () => {
+    const { port, messages, invitations } = await adapter();
+    try {
+      const modern = '<nav><a href="/feed/">Home</a><a href="/messaging/">Messaging</a></nav>';
+      await messages.setContent(modern);
+      await invitations.setContent(modern);
+      await port.login(AbortSignal.timeout(2000));
+      expect(await port.authenticated()).toBe(true);
+      await messages.goto('https://www.linkedin.com/checkpoint/');
+      expect(await port.authenticated()).toBe(false);
+    } finally { await port.close(); }
+  });
+  it('does not accept generic or hidden navigation as proof of login', async () => {
+    const { port, messages, invitations } = await adapter();
+    try {
+      const hidden = '<nav>Public links</nav><nav hidden><a href="/feed/">Home</a><a href="/messaging/">Messaging</a></nav>';
+      await messages.setContent(hidden);
+      await invitations.setContent(hidden);
+      expect(await port.authenticated()).toBe(false);
+    } finally { await port.close(); }
+  });
   it('restricts profile navigation to LinkedIn profile paths', () => {
     expect(profileUrl('/in/synthetic/?tracking=1')).toBe('https://www.linkedin.com/in/synthetic/');
     expect(() => profileUrl('https://example.invalid/in/synthetic/')).toThrow();

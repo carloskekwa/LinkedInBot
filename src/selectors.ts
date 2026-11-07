@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 // LinkedIn changes its DOM. These selectors require a live smoke check.
 export const defaults = {
-  nav: '.global-nav',
+  nav: '.global-nav, nav:has(a[href*="/feed"]):has(a[href*="/messaging"]), [role="navigation"]:has(a[href*="/feed"]):has(a[href*="/messaging"])',
   me: '.global-nav__me',
   ownerProfile: '.global-nav__me-content a[href*="/in/"], .global-nav a[href*="/in/"]',
   invitationList: '.invitation-manager, .mn-invitation-manager, .mn-invitations-preview',

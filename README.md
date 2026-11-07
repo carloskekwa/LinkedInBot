@@ -346,6 +346,11 @@ linguistic quality or injection resistance. CI installs Chromium before running 
 - Checkpoint/login redirect: resolve manually in Chromium; both workers pause for
   recognized checkpoints. Shared login cookies allow workers to restore their own
   redirected tabs once at least one tab is authenticated.
+- Logged in but stuck at "Log in manually": monitoring has not started. Login
+  detection accepts visible legacy navigation or a navigation region containing
+  both Feed and Messaging links. Every 30 seconds it logs sanitized page state and
+  selector counts. If those remain absent, update the `nav` selector after inspecting
+  the actual UI; do not bypass the authentication check.
 - Uncertain action: inspect manually; no blind retry or database reset.
 - High latency: inspect stage metrics, navigation, model performance, inbox size,
   periodic refresh delay and caps before lowering intervals. Do not evade restrictions.

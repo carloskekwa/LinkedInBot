@@ -58,8 +58,21 @@ export class PlaywrightAdapter implements LinkedInPort {
   }
   async login(signal: AbortSignal): Promise<void> {
     this.log.info('Log in manually in Chromium. Resolve any checkpoint yourself.');
+    let nextDiagnostic = Date.now() + 30_000;
     while (!signal.aborted) {
-      if (await this.isAuthenticated(this.messagesPage)) return;
+      if (await this.isAuthenticated(this.messagesPage)) {
+        this.log.info('Authenticated navigation detected; continuing startup');
+        return;
+      }
+      if (Date.now() >= nextDiagnostic) {
+        const path = new URL(this.messagesPage.url()).pathname;
+        this.log.warn({
+          pagePath: ['/feed/', '/messaging/', '/login', '/checkpoint/', '/authwall'].includes(path)
+            ? path : 'other',
+          navigationMatches: await this.messagesPage.locator(this.selectors.nav).count(),
+        }, 'Still waiting for authenticated navigation. If already logged in, check the nav selector; monitoring has not started');
+        nextDiagnostic = Date.now() + 30_000;
+      }
       await delay(1_000, undefined, { signal });
     }
     signal.throwIfAborted();
@@ -68,7 +81,7 @@ export class PlaywrightAdapter implements LinkedInPort {
     if (page.isClosed()) throw new Error('Worker browser page closed');
     const url = new URL(page.url());
     if (url.origin !== origin || /\/(login|checkpoint|authwall|uas)\b/.test(url.pathname)) return false;
-    return page.locator(this.selectors.nav).first().isVisible();
+    return await page.locator(this.selectors.nav).filter({ visible: true }).count() > 0;
   }
   async authenticated(): Promise<boolean> {
     const pages = [this.messagesPage, this.invitationsPage];
