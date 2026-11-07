@@ -330,10 +330,11 @@ or unresolved-outcome safety.
 
 ### Monitoring and load
 
-Defaults: invitation poll 20 seconds, messaging poll 10 seconds, +/-20% jitter;
+Defaults: invitation poll 20 seconds, messaging poll 40 seconds, +/-20% jitter;
 debounce 7 seconds after a change, capped at 20 seconds; 60 external actions/hour.
 The elapsed worker time is subtracted from the wait to avoid overlapping intervals.
-Actual debounce resolution is limited by polling and thread navigation.
+Actual debounce resolution is limited by polling and thread navigation: with a 40-second
+poll, a new message is normally answered 40–80 seconds after it is first seen.
 
 Polls only read the already-loaded page. Full reloads are separate and rarer: the
 invitation page reloads about every 3 minutes (`INVITATION_REFRESH_MS=180000`) and the

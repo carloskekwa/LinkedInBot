@@ -17,7 +17,7 @@ const schema = z.object({
     } catch { return false; }
   }, 'OWNER_PROFILE_URL must be your https://www.linkedin.com/in/... profile URL'),
   INVITATION_POLL_MS: positive(20_000),
-  MESSAGE_POLL_MS: positive(10_000),
+  MESSAGE_POLL_MS: positive(40_000),
   // How often the pages are fully reloaded. Polls between reloads only read the live DOM.
   // Frequent reloads get rejected by LinkedIn (HTTP errors), so these stay conservative.
   INVITATION_REFRESH_MS: positive(180_000),
