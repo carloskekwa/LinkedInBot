@@ -392,6 +392,23 @@ describe('action orchestration', () => {
     });
     expect(await s.fake.verifySend('t', hash('How can I help?'), 'm1')).toBe('uncertain');
   });
+  it('tells the adapter about each confirmed acceptance, including one confirmed by reconciliation', async () => {
+    const s = setup();
+    s.fake.pending.push({ id: 'p', receipt: syntheticMessage('x').receipt });
+    await s.bot.invitationTick();
+    expect(s.fake.acceptanceNotes).toBe(1);
+    await s.bot.invitationTick();
+    expect(s.fake.acceptanceNotes).toBe(1);
+    // Uncertain at first, confirmed by a later re-check: still exactly one note.
+    const late = setup(); late.fake.uncertainAccept = true;
+    late.fake.pending.push({ id: 'q', receipt: unknownReceipt() });
+    await late.bot.invitationTick();
+    expect(late.fake.acceptanceNotes).toBe(0);
+    late.fake.uncertainAccept = false;
+    late.advance(300_000); await late.bot.invitationTick();
+    expect(late.store.all()[0]?.status).toBe('confirmed');
+    expect(late.fake.acceptanceNotes).toBe(1);
+  });
   it('uncertain invitation is not clicked again', async () => {
     const s = setup(); s.fake.uncertainAccept = true;
     s.fake.pending.push({ id: 'p', receipt: unknownReceipt() });

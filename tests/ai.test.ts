@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pino } from 'pino';
 import { loadConfig, loadOwnerFacts, loadPrompt } from '../src/config.js';
-import { guardReply, LlmGenerator, commitmentIssue, reviewReply } from '../src/ai.js';
+import { guardReply, LlmGenerator, commitmentIssue, isHiringContext, reviewReply } from '../src/ai.js';
 import { syntheticMessage } from '../src/demo.js';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -235,6 +235,63 @@ describe('configuration and LLM contract', () => {
       const { result } = run([completion(draft('I\'m a real person.')), completion(draft('I\'m a real person.'))],
         'what do you think of the new release?');
       await expect(result()).rejects.toThrow();
+    });
+    it('in a hiring conversation, a developer-style question is rewritten into a role question', async () => {
+      const facts = ['I mostly work on iOS development with Swift, SwiftUI, UIKit, and Objective-C.',
+        'If asked about a new job or opportunity: I\'m open to new opportunities.'];
+      const fetchMock = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(completion(draft('My main stack is iOS development with Swift, SwiftUI, UIKit, ' +
+          'and Objective-C. What are you working on?')))
+        .mockResolvedValueOnce(completion(draft('My main stack is iOS development with Swift, SwiftUI, UIKit, ' +
+          'and Objective-C. Is the role mainly Rails?')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }), facts);
+      const reply = await withFacts.generate([
+        syntheticMessage('q1', 'are you willing to change job ?'),
+        { ...syntheticMessage('a1', 'I\'m open to new opportunities! Could you share a few details about it?'), own: true },
+        syntheticMessage('q2', 'do u know ruby on rails ?'),
+      ], new AbortController().signal);
+      expect(reply.reply).toBe('My main stack is iOS development with Swift, SwiftUI, UIKit, and Objective-C. Is the role mainly Rails?');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
+      expect(retryBody.messages[0].content).toContain('recruiter or hiring manager');
+    });
+    it('in a hiring conversation, a persistent developer-style question is dropped, keeping the answer', async () => {
+      const facts = ['I mostly work on iOS development with Swift.'];
+      const fetchMock = vi.fn<typeof fetch>()
+        .mockResolvedValueOnce(completion(draft('My main stack is iOS development with Swift. What are you building?')))
+        .mockResolvedValueOnce(completion(draft('My main stack is iOS development with Swift. What about you?')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }), facts);
+      const reply = await withFacts.generate([
+        syntheticMessage('q1', 'We have a senior position open, interested?'),
+        { ...syntheticMessage('a1', 'Could you share a few details about it?'), own: true },
+        syntheticMessage('q2', 'do you know Go?'),
+      ], new AbortController().signal);
+      expect(reply.reply).toBe('My main stack is iOS development with Swift.');
+    });
+    it('outside a hiring conversation, asking what the sender is working on is allowed', async () => {
+      const { fetchMock, result } = run([completion(draft('My main stack is Swift. What are you working on?'))],
+        'do you know Go?');
+      expect((await result()).reply).toBe('My main stack is Swift. What are you working on?');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it('detects hiring context from any earlier incoming message, not just the latest', () => {
+      for (const text of ['are you willing to change job ?', 'We are hiring a senior iOS engineer',
+        'What is your salary expectation?', 'We have a senior position open, interested?',
+        'Are you open to new opportunities?', 'I\'m a recruiter at Example Talent', 'Any plans for a new role?',
+        'Here is the JD', 'would you consider a career move?', 'There is an opening for an iOS developer']) {
+        expect(isHiringContext([text]), text).toBe(true);
+      }
+      expect(isHiringContext(['are you willing to change job ?', 'do u know ruby on rails ?'])).toBe(true);
+      for (const text of ['hi', 'do you know Go?', 'loved your post about SwiftUI',
+        'I can offer you a discount on the course', 'the opening scene was great', 'my career advice post',
+        'what role did the library play?', 'nice interview with the CEO on your feed', 'any job tips?',
+        'What a great position to be in!', 'the job ran for 3 hours']) {
+        expect(isHiringContext([text]), text).toBe(false);
+      }
     });
     it('rejects denials of experience in every phrasing, even when facts are listed', () => {
       const facts = ['I work as a mobile engineer using Swift, Java and Spring Boot.'];

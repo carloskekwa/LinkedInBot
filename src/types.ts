@@ -34,6 +34,9 @@ export interface LinkedInPort {
   close(): Promise<void>;
   // Threads first seen after startup whose latest activity is clearly old (not today).
   staleConversations?(): ReadonlySet<string>;
+  // A connection request was just accepted: the new connection's thread will appear in the
+  // inbox after the next reload, and its messages may predate the acceptance.
+  noteAcceptance?(): void;
 }
 export interface Reply {
   should_reply: boolean;

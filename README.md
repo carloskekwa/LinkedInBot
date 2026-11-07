@@ -287,7 +287,13 @@ that are not supported by the owner facts (questions are never treated as claims
 denials of experience or knowledge ("I don't have experience with X"), which are always
 rejected because a facts list can support a "yes" but never a "no"; and
 (3) support-bot phrasing and the stock "What about you?" follow-up, which assumes the
-sender's background. A statement of interest, availability or commitment passes only if
+sender's background. Once an incoming message has raised jobs, roles, hiring, salary or a
+recruiter, the sender is treated as a recruiter for the rest of the conversation: a reply
+that asks what they are working on or building gets one rewrite (ask about the role or
+the job description instead), and if the question survives it is dropped and the answer
+stands alone. Detection uses hiring phrases ("willing to change job", "we're hiring",
+"open to new opportunities", "salary"), not single words like "role" or "offer".
+A statement of interest, availability or commitment passes only if
 the sentence has at least two content words and your facts support every one of them
 (so "I'm open to new opportunities" passes when you wrote that; "I'm interested.", "I'd
 love to join your team" or "I'm open to a call tomorrow" do not, whatever the facts say).
@@ -340,7 +346,18 @@ to roughly one refresh interval before it is seen, so expect acceptance latency 
 minutes, not seconds; lowering `INVITATION_REFRESH_MS` speeds this up but raises the
 risk of throttling. The messaging reload also bounds how long a silently dead live
 update channel could blind the bot. This deliberately does not assume a parked
-LinkedIn page always receives updates. Threads are switched by **clicking the
+LinkedIn page always receives updates.
+
+**New connections.** A message from someone who is not yet a connection sits in the
+"Other" tab, where the bot does not look. Accepting the request moves it into the main
+inbox, but the loaded page only shows that after a reload. So each confirmed acceptance
+schedules one messaging reload about a minute later (`POST_ACCEPT_REFRESH_MS=60000`,
++/-20%, never later than the reload already planned), and for at least 10 minutes after
+that, a thread that surfaces with old-looking activity is treated as new rather than as
+stale history, because a connection note is often days older than its acceptance. The
+trade-off: an unrelated old thread that LinkedIn happens to render late in that window
+would also be answered. Only confirmed acceptances count; uncertain ones do not trigger a
+reload. Threads are switched by **clicking the
 conversation card inside the loaded app**, as a user would, and the adapter waits for
 the message view to actually change before reading, so it can never read the previous
 thread's messages as the new one. Direct URL navigation is only a fallback: in testing,

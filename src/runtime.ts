@@ -63,6 +63,7 @@ export class Bot {
     return ok;
   }
   private logConfirmation(action: Action): void {
+    if (action.kind === 'invitation') this.port.noteAcceptance?.();
     this.log.info({
       actionId: action.id, kind: action.kind, ref: hash(action.ref),
       receivedAt: action.receivedAt, receiptPrecision: action.precision,

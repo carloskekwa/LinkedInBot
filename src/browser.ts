@@ -112,6 +112,9 @@ export class PlaywrightAdapter implements LinkedInPort {
   private nextMessageRefresh = 0;
   private readonly invitationRefreshMs: number;
   private readonly messageRefreshMs: number;
+  private readonly postAcceptRefreshMs: number;
+  // Until this time, late-surfacing threads with old activity are not marked stale.
+  private freshUntil = 0;
   private readonly threadLimit: number;
   private readonly changeWindowMs: number;
   private scanned = false;
@@ -132,8 +135,21 @@ export class PlaywrightAdapter implements LinkedInPort {
     this.threadLimit = config.THREAD_LIMIT;
     this.invitationRefreshMs = config.INVITATION_REFRESH_MS;
     this.messageRefreshMs = config.MESSAGE_REFRESH_MS;
+    this.postAcceptRefreshMs = config.POST_ACCEPT_REFRESH_MS;
     // Long enough for the debounce cap plus two polls to observe the final message.
     this.changeWindowMs = config.MAX_DEBOUNCE_MS + 2 * config.MESSAGE_POLL_MS;
+  }
+  // Pulls the next messaging reload forward to about POST_ACCEPT_REFRESH_MS from now (never
+  // later than already planned). Threads surfacing for a while afterwards are treated as new
+  // even if their last activity looks old: a connection note is often days older than its
+  // acceptance, and it still deserves an answer.
+  noteAcceptance(): void {
+    const planned = jittered(Date.now(), this.postAcceptRefreshMs);
+    this.nextMessageRefresh = Math.min(this.nextMessageRefresh || planned, planned);
+    // Long enough for the reload, lazy card rendering and the debounce; at least 10 minutes.
+    this.freshUntil = Math.max(this.freshUntil, planned + Math.max(600_000, 2 * this.postAcceptRefreshMs));
+    this.log.info({ refreshInSeconds: Math.round((this.nextMessageRefresh - Date.now()) / 1000) },
+      'Connection accepted; messaging page will reload so the new thread moves into the inbox');
   }
 
   static async open(config: Config, log: Logger): Promise<PlaywrightAdapter> {
@@ -361,8 +377,9 @@ export class PlaywrightAdapter implements LinkedInPort {
         }
         this.openThread = id;
         this.knownThreads.set(key, id);
-        // LinkedIn renders cards lazily, so an old thread can surface after startup.
-        if (!firstScan && looksOld(timeLabel)) this.staleLate.add(id);
+        // LinkedIn renders cards lazily, so an old thread can surface after startup. Not after
+        // an acceptance, though: that is the new connection's thread, however old its note.
+        if (!firstScan && looksOld(timeLabel) && now >= this.freshUntil) this.staleLate.add(id);
       }
       const previous = this.fingerprints.get(key);
       if (previous !== fingerprint) {

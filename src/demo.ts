@@ -24,6 +24,8 @@ export class FakeAdapter implements LinkedInPort {
   failingThreads = new Set<string>();
   stale = new Set<string>();
   staleConversations(): ReadonlySet<string> { return this.stale; }
+  acceptanceNotes = 0;
+  noteAcceptance(): void { this.acceptanceNotes++; }
   failureMessage = 'Synthetic thread failure';
   threadReads = new Map<string, number>();
   async authenticated(): Promise<boolean> { return this.loggedIn; }

@@ -218,6 +218,46 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
       expect([...port.staleConversations()]).toEqual([base + '3/']);
     } finally { await port.close(); }
   });
+  it('after an acceptance, reloads the messaging page early and treats the surfacing thread as new', async () => {
+    const mark = () => { (window as unknown as Record<string, unknown>)['__m'] = 'kept'; };
+    const read = () => (window as unknown as Record<string, unknown>)['__m'];
+    // 1 ms: the acceptance-triggered reload is due at once; the regular one is an hour away.
+    const { port, messages } = await adapter('', fixture, { MESSAGE_REFRESH_MS: '3600000', POST_ACCEPT_REFRESH_MS: '1' });
+    try {
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      await port.conversations();
+      await messages.evaluate(mark);
+      await port.conversations();
+      expect(await messages.evaluate(read)).toBe('kept');
+      port.noteAcceptance();
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await port.conversations();
+      expect(await messages.evaluate(read)).toBeUndefined();
+      // The new connection's thread surfaces with an old note: not stale, so it gets answered.
+      await messages.evaluate(() => {
+        const list = document.querySelector('ul.msg-conversations-container__conversations-list')!;
+        const li = document.createElement('li');
+        li.className = 'msg-conversation-listitem';
+        li.innerHTML = '<div class="msg-conversation-listitem__link" onclick="openFixtureThread(7)">' +
+          '<h3 class="msg-conversation-listitem__participant-names">New connection</h3>' +
+          '<p class="msg-conversation-card__message-snippet">Thanks for connecting</p>' +
+          '<time class="msg-conversation-card__time-stamp">Nov 3</time></div>';
+        list.append(li);
+      });
+      const reported = await port.conversations();
+      expect(reported).toContain('https://www.linkedin.com/messaging/thread/synthetic-7/');
+      expect(port.staleConversations().size).toBe(0);
+    } finally { await port.close(); }
+  });
+  it('never pushes the acceptance reload later than one already planned', async () => {
+    const { port } = await adapter('', fixture, { MESSAGE_REFRESH_MS: '1', POST_ACCEPT_REFRESH_MS: '3600000' });
+    try {
+      await port.conversations();
+      const before = (port as unknown as { nextMessageRefresh: number }).nextMessageRefresh;
+      port.noteAcceptance();
+      expect((port as unknown as { nextMessageRefresh: number }).nextMessageRefresh).toBe(before);
+    } finally { await port.close(); }
+  });
   it('jitters refresh times within +/-20% of the interval', () => {
     expect(jittered(1000, 100_000, () => 0)).toBeCloseTo(81_000);
     expect(jittered(1000, 100_000, () => 1)).toBeCloseTo(121_000);

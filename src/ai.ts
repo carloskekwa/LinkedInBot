@@ -53,7 +53,7 @@ const COMMITMENT = new RegExp([
 ].join('|'), 'i');
 export interface ReplyIssue {
   rule: 'commitment' | 'owner-claim' | 'support-bot-style' | 'greeting-context' | 'smalltalk-context' |
-    'automation-denial';
+    'automation-denial' | 'hiring-context';
   message: string; hard: boolean; safeReply?: string;
 }
 // A short message that is only asking whether the sender is talking to a bot/AI/real person.
@@ -123,6 +123,23 @@ const DENIAL = new RegExp([
 ].join('|'), 'i');
 // A stock follow-up that assumes the sender is a peer; the owner may be talking to a recruiter or a client.
 const GENERIC_FOLLOWUP = /\b(?:what|how) about (?:you|yourself)\b|\band you\s*\?|\bwhat do you do\b/i;
+// The sender has brought up jobs, roles or hiring: from then on they are treated as a recruiter
+// or hiring manager, so questions that suit a fellow developer do not fit.
+const HIRING_CONTEXT = new RegExp([
+  // The sender's own hiring intent, or a question about the owner's job situation.
+  '\\b(?:we(?:\'re| are)|i(?:\'m| am)) (?:currently )?(?:hiring|recruiting|looking for|searching for|seeking)\\b',
+  '\\b(?:job|role|position|vacancy|opening|opportunity)\\s+(?:open|available|for you|at|with|in)\\b',
+  '\\b(?:open|openings?|vacanc(?:y|ies)|positions?|roles?) (?:for|as) (?:a |an )?(?:senior |junior |lead |staff |principal |ios |mobile |backend |frontend |full.?stack )*(?:developer|engineer|architect|designer|manager)\\b',
+  '\\b(?:new|next|another|different) (?:job|role|position|opportunit(?:y|ies)|challenge)\\b',
+  '\\b(?:change|switch|leave|move) (?:your )?(?:jobs?|roles?|compan(?:y|ies)|employer)\\b',
+  '\\b(?:open to|interested in|willing to (?:consider|hear about|discuss)) (?:new |other |a )?(?:opportunit(?:y|ies)|roles?|positions?|offers?|jobs?|relocat\\w*)\\b',
+  '\\b(?:recruiter|recruiting|recruitment|talent acquisition|headhunter|hiring manager)\\b',
+  '\\b(?:job description|\\bjd\\b|job offer|offer letter|salary|compensation|notice period|relocation|interview process|interview with us)\\b',
+  '\\b(?:willing|ready|happy) to (?:change|move|switch|relocate)\\b',
+  '\\bcareer (?:move|change|opportunit\\w*|step)\\b',
+].join('|'), 'i');
+const PEER_QUESTION = /\b(?:what|how) about (?:you|yourself)\b|\band you\s*\?|\bwhat do you do\b|\bwhat are you (?:working on|building|up to)\b|\bwhat(?:'s| is) your (?:stack|setup|focus)\b|\bwhat (?:do you|are you) (?:use|using)\b/i;
+export const isHiringContext = (incomingTexts: string[]): boolean => incomingTexts.some(t => HIRING_CONTEXT.test(t));
 const SELF_DISCLOSURE = /^(?:an?\s+)?(?:automated|assistant|ai|bot|virtual|digital)\b/i;
 const wordsOf = (text: string): string[] =>
   (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
@@ -213,6 +230,7 @@ export class LlmGenerator implements ReplyGenerator {
       attachmentNotInspected: m.attachment,
     }));
     const omitted = Math.max(0, messages.length - context.length);
+    const hiring = isHiringContext(context.filter(m => m.sender === 'incoming').map(m => m.text));
     const latest = messages.at(-1);
     const asksIfBot = !!latest && !latest.own &&
       BOT_QUESTION.test(latest.text.replace(/[\u2018\u2019]/g, '\''));
@@ -250,6 +268,24 @@ export class LlmGenerator implements ReplyGenerator {
         reply.reply = answer;
       }
       let issue = reply.should_reply ? reviewReply(reply.reply, this.ownerFacts) : null;
+      // In a hiring conversation a question that suits a fellow developer ("what are you working
+      // on?") misreads the sender. One rewrite may replace it with a question about the role; if
+      // it is still there, the question is dropped and the answer stands on its own.
+      if ((!issue || !issue.hard) && reply.should_reply && hiring) {
+        const sentences = reply.reply.split(/(?<=[.!?])\s+/);
+        if (sentences.some(s => PEER_QUESTION.test(s.replace(/[\u2018\u2019]/g, '\'')))) {
+          const answer = sentences.filter(s => !PEER_QUESTION.test(s.replace(/[\u2018\u2019]/g, '\''))).join(' ').trim();
+          if (attempt === 2 && answer) {
+            this.log.debug({ rule: 'hiring-context' }, 'Dropped a developer-style question in a hiring conversation');
+            reply.reply = answer;
+            issue = reviewReply(answer, this.ownerFacts);
+          } else {
+            issue = { rule: 'hiring-context', hard: true, message: 'it asked the sender what they are working ' +
+              'on or about their own work, but this conversation is about a job or hiring, so the sender is a ' +
+              'recruiter or hiring manager. Ask about the role or the job description instead, or ask nothing' };
+          }
+        }
+      }
       if ((!issue || !issue.hard) && reply.should_reply && smallTalkReply &&
           (/\bprofile\b/i.test(reply.reply) || ownerClaimIssue(reply.reply, []) !== null ||
             (OWNER_STATE.test(reply.reply.replace(/[\u2018\u2019]/g, '\'')) &&

@@ -22,6 +22,10 @@ const schema = z.object({
   // Frequent reloads get rejected by LinkedIn (HTTP errors), so these stay conservative.
   INVITATION_REFRESH_MS: positive(180_000),
   MESSAGE_REFRESH_MS: positive(300_000),
+  // After a connection request is accepted, the new connection's thread moves from "Other"
+  // to the main inbox only once the messaging page reloads. One reload is scheduled this
+  // long (+/-20%) after each confirmed acceptance, so the bot sees and answers that thread.
+  POST_ACCEPT_REFRESH_MS: positive(120_000),
   DEBOUNCE_MS: positive(7_000),
   MAX_DEBOUNCE_MS: positive(20_000),
   MAX_ACTIONS_PER_HOUR: positive(60),
@@ -46,7 +50,7 @@ const schema = z.object({
   // Private facts the bot may state about the owner (gitignored). Optional.
   OWNER_FACTS_FILE: z.string().default('./prompts/owner-facts.md'),
   FALLBACK_REPLY: z.string().min(1).max(300).default(
-    "Thanks for your message! This is an automated reply, and I can't give you a proper answer right now.",
+    "Thanks for your message! and I can't give you a proper answer right now.",
   ),
   INITIAL_HISTORY: z.enum(['baseline', 'reply-latest']).default('baseline'),
   SELECTORS_FILE: z.string().default(''),
