@@ -240,6 +240,11 @@ unknown and answered with "It's on my profile if you want to take a look." Start
 whether facts were loaded. These lines are sent to the AI provider with every reply and can
 be repeated to the other person, so keep out phone numbers, private emails, addresses and
 salary. Lines still containing `<placeholders>` are ignored.
+Direct location, employer and role questions should get only the answer, without a
+reciprocal question or assumptions about the sender's occupation. Recognized English
+direct-fact questions have question sentences removed from the draft before its remaining
+answer is checked for unsupported claims. Opportunity and meeting requests can still
+ask for details.
 
 **Rewrite check.** Prompts cannot guarantee compliance, and in testing a small model
 invented a location, an employer-style claim, "10 years of experience" and "I don't work
@@ -258,8 +263,10 @@ second, only when needed). The model receives the latest incoming message explic
 with earlier messages labeled as background and owner facts restricted to relevant asks.
 Recognized plain English greetings, wellbeing questions, thanks and closings must not
 get owner facts or a profile referral. Persistent hard violations get a short contextual
-substitute (for example "Hey!" or "Thanks for asking! How's your day going?"), without
-inventing the owner's feelings or day. This small-talk check uses narrow English patterns;
+substitute (for example "Hey!" or the owner-approved conventional wellbeing greeting
+"All good! How's your day going?"), without adding invented feelings or events in the
+owner's day. That exact wellbeing greeting is permitted only for recognized wellbeing
+questions, not for other messages. This small-talk check uses narrow English patterns;
 it does not cover every phrasing or language.
 Persistent commitments in other English messages get "Could you share a few more details?".
 Other persistent unsupported claims and non-English hard violations use the explicit

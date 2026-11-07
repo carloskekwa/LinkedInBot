@@ -337,9 +337,9 @@ describe('configuration and LLM contract', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
     it.each([
-      ['how are you doing today?', 'Thanks for asking! How\'s your day going?'],
-      ['Hey, how are you?', 'Thanks for asking! How\'s your day going?'],
-      ['How\u2019s your day going?', 'Thanks for asking! How\'s your day going?'],
+      ['how are you doing today?', 'All good! How\'s your day going?'],
+      ['Hey, how are you?', 'All good! How\'s your day going?'],
+      ['How\u2019s your day going?', 'All good! How\'s your day going?'],
       ['thanks!', 'Anytime!'],
       ['ok', 'Got it.'],
       ['bye', 'Take care!'],
@@ -374,10 +374,50 @@ describe('configuration and LLM contract', () => {
     it('uses a natural rewrite for the reported wellbeing question', async () => {
       const { fetchMock, result } = run([
         completion(draft('I live in London.')),
-        completion(draft('Thanks for asking! How\'s your day going?')),
+        completion(draft('All good! How\'s your day going?')),
       ], 'how are you doing today?');
-      expect((await result()).reply).toBe('Thanks for asking! How\'s your day going?');
+      expect((await result()).reply).toBe('All good! How\'s your day going?');
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+    it('accepts the exact owner-approved wellbeing greeting without a rewrite', async () => {
+      const { fetchMock, result } = run([completion(draft('All good! How\'s your day going?'))],
+        'how are you doing ?');
+      expect((await result()).reply).toBe('All good! How\'s your day going?');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it.each([
+      ['Where do you work?', 'I work at Example Corp. What about you?', 'I work at Example Corp.'],
+      ['where are you located', 'I\'m based in Exampleville. Where are you based?', 'I\'m based in Exampleville.'],
+      ['What is your role?', 'I\'m an engineer. What are you working on?', 'I\'m an engineer.'],
+    ])('answers %s without asking the sender a question', async (incoming, draftText, expected) => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(completion(draft(draftText)));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true',
+        LLM_API_KEY: 'synthetic-test-key' }), 'test system', pino({ level: 'silent' }),
+        ['I work at Example Corp.', 'I am based in Exampleville.', 'I am an engineer.']);
+      expect((await withFacts.generate([syntheticMessage('m', incoming)],
+        new AbortController().signal)).reply).toBe(expected);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it('still rejects unsupported facts after removing a reciprocal question', async () => {
+      const { result } = run([completion(draft('I work at Unlisted Corp. What about you?')),
+        completion(draft('I work at Another Corp. Where do you work?'))], 'Where do you work?');
+      await expect(result()).rejects.toThrow('unsupported claim');
+    });
+    it('keeps necessary opportunity clarification questions', async () => {
+      const { result } = run([completion(draft('Could you share a few details about the role?'))],
+        'Are you open to new opportunities?');
+      expect((await result()).reply).toBe('Could you share a few details about the role?');
+    });
+    it('does not allow the wellbeing exception for hi or added personal activities', async () => {
+      for (const [incoming, answer] of [
+        ['hi', 'All good! How\'s your day going?'],
+        ['how are you?', 'All good! Just keeping busy. How\'s your day going?'],
+      ] as const) {
+        const { fetchMock, result } = run([completion(draft(answer)), completion(draft('Hey!'))], incoming);
+        expect((await result()).reply).toBe('Hey!');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      }
     });
     it.each(['how are you doing today? Where do you work?', 'thanks, can we meet tomorrow?'])(
       'does not classify a mixed substantive message as small talk: %s', async incoming => {

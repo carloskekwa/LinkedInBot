@@ -74,6 +74,7 @@ const AUTOMATION_DENIAL = new RegExp([
 const SAFE_COMMITMENT = 'Could you share a few more details?';
 const GREETING = /^(?:hi|hello|hey(?: there)?|good morning|good afternoon|good evening)[.!?]*$/i;
 const WELLBEING = /^(?:(?:hi|hello|hey)[,!.\s]+)?(?:how are you(?: doing)?(?: today| lately)?|how(?:'s| is) it going|how have you been|how(?:'s| is) your day(?: going)?)[.!?]*$/i;
+const APPROVED_WELLBEING_REPLY = 'All good! How\'s your day going?';
 // Invented feelings or activities of the owner ("not much, just keeping busy", "doing great").
 const OWNER_STATE = new RegExp([
   '\\bnot much\\b', '\\bkeeping busy\\b', '\\b(?:pretty|really|very|so)\\s+busy\\b', '\\bi\'?m busy\\b',
@@ -85,6 +86,7 @@ const OWNER_STATE = new RegExp([
 const THANKS = /^(?:thanks(?: a lot| so much)?|thank you(?: so much)?)[.!?]*$/i;
 const ACKNOWLEDGEMENT = /^ok(?:ay)?[.!?]*$/i;
 const CLOSING = /^(?:bye|goodbye|see you|take care)[.!?]*$/i;
+const DIRECT_OWNER_FACT = /\b(?:where (?:are (?:you|u) (?:located|based|living)|do (?:you|u) (?:work|live))|what(?:'s| is) your (?:role|job|title|location|employer)|what do (?:you|u) do|who do (?:you|u) work for|which company do (?:you|u) work (?:at|for))\b/i;
 
 // First-person claims about the owner that need support in the approved facts.
 const CLAIMS: RegExp[] = [
@@ -200,8 +202,9 @@ export class LlmGenerator implements ReplyGenerator {
     const greeting = latest && !latest.own && !latest.attachment && GREETING.test(latest.text.trim());
     const latestText = latest && !latest.own && !latest.attachment
       ? latest.text.trim().replace(/[\u2018\u2019]/g, '\'') : '';
-    const smallTalkReply = greeting ? 'Hey!' : WELLBEING.test(latestText)
-      ? 'Thanks for asking! How\'s your day going?' : THANKS.test(latestText)
+    const wellbeing = WELLBEING.test(latestText);
+    const smallTalkReply = greeting ? 'Hey!' : wellbeing
+      ? APPROVED_WELLBEING_REPLY : THANKS.test(latestText)
         ? 'Anytime!' : ACKNOWLEDGEMENT.test(latestText) ? 'Got it.'
           : CLOSING.test(latestText) ? 'Take care!' : undefined;
     let feedback: string | undefined;
@@ -216,10 +219,18 @@ export class LlmGenerator implements ReplyGenerator {
         this.log.debug('Draft unusable; requesting one rewrite');
         continue;
       }
+      if (reply.should_reply && DIRECT_OWNER_FACT.test(latestText) && reply.reply.includes('?')) {
+        const answer = reply.reply.split(/(?<=[.!?])\s+/)
+          .filter(sentence => !sentence.includes('?')).join(' ').trim();
+        this.log.debug('Removed follow-up questions from a direct owner-fact answer');
+        if (!answer) throw new Error('Direct owner-fact draft contained no answer without a question');
+        reply.reply = answer;
+      }
       let issue = reply.should_reply ? reviewReply(reply.reply, this.ownerFacts) : null;
       if ((!issue || !issue.hard) && reply.should_reply && smallTalkReply &&
           (/\bprofile\b/i.test(reply.reply) || ownerClaimIssue(reply.reply, []) !== null ||
-            OWNER_STATE.test(reply.reply.replace(/[\u2018\u2019]/g, '\'')))) {
+            (OWNER_STATE.test(reply.reply.replace(/[\u2018\u2019]/g, '\'')) &&
+              !(wellbeing && reply.reply.replace(/[\u2018\u2019]/g, '\'') === APPROVED_WELLBEING_REPLY)))) {
         issue = { rule: greeting ? 'greeting-context' : 'smalltalk-context', hard: true,
           message: 'it answered small talk with owner information, a profile referral, or an invented ' +
             'state, activity or feeling of the owner (for example "not much", "keeping busy", "doing well"). ' +
