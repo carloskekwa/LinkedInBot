@@ -70,6 +70,14 @@ describe('action orchestration', () => {
     s.advance(130_000); await s.bot.messageTick();
     expect(s.fake.threadReads.get('bad')).toBe(reads + 1);
   });
+  it('escalates a LinkedIn HTTP rejection instead of walking every remaining thread', async () => {
+    const s = setup();
+    s.fake.threads.set('later', { id: 'later', supported: true, messages: [syntheticMessage('x1')] });
+    s.fake.failingThreads.add('t');
+    s.fake.failureMessage = 'page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at https://example.invalid/';
+    await expect(s.bot.messageTick()).rejects.toThrow('ERR_HTTP_RESPONSE_CODE_FAILURE');
+    expect(s.fake.threadReads.get('later') ?? 0).toBe(0);
+  });
   it('still stops promptly when aborted during thread processing', async () => {
     const s = setup(); s.controller.abort();
     await expect(s.bot.messageTick()).rejects.toThrow();

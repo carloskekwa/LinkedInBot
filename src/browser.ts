@@ -7,6 +7,8 @@ import { hash, messageId, parseReceipt, unknownReceipt } from './time.js';
 import type { Invitation, LinkedInPort, Message, Thread, Verification } from './types.js';
 
 const origin = 'https://www.linkedin.com';
+// How long to wait for the message view to refresh after switching conversations.
+const SWITCH_SETTLE_MS = 5_000;
 const invitationsUrl = `${origin}/mynetwork/invitation-manager/received/?invitationType=CONNECTION`;
 export function profileUrl(raw: string): string {
   const result = tryProfileUrl(raw);
@@ -133,6 +135,7 @@ export class PlaywrightAdapter implements LinkedInPort {
     }
     await this.invitationsPage.goto(invitationsUrl, { waitUntil: 'domcontentloaded' });
     await this.messagesPage.goto(`${origin}/messaging/`, { waitUntil: 'domcontentloaded' });
+    this.lastInvitationRefresh = this.lastMessageRefresh = Date.now();
     await this.healthCheck();
   }
   ownerIdentity(): string {
@@ -147,6 +150,7 @@ export class PlaywrightAdapter implements LinkedInPort {
   private async ensureInvitationList(): Promise<void> {
     if (!this.invitationsPage.url().includes('/invitation-manager')) {
       await this.invitationsPage.goto(invitationsUrl, { waitUntil: 'domcontentloaded' });
+      this.lastInvitationRefresh = Date.now();
     } else if (Date.now() - this.lastInvitationRefresh > 60_000) {
       // A parked page is not guaranteed to receive invitations live.
       await this.invitationsPage.reload({ waitUntil: 'domcontentloaded' });
@@ -216,6 +220,7 @@ export class PlaywrightAdapter implements LinkedInPort {
   async conversations(): Promise<string[]> {
     if (!this.messagesPage.url().includes('/messaging/')) {
       await this.messagesPage.goto(`${origin}/messaging/`, { waitUntil: 'domcontentloaded' });
+      this.lastMessageRefresh = Date.now();
       this.openThread = '';
     } else if (Date.now() - this.lastMessageRefresh > 300_000) {
       await this.messagesPage.reload({ waitUntil: 'domcontentloaded' });
@@ -258,11 +263,7 @@ export class PlaywrightAdapter implements LinkedInPort {
           if (await item.locator(this.selectors.conversationActive).count()) {
             id = threadUrl(this.messagesPage.url());
           } else {
-            const previous = this.messagesPage.url();
-            await item.locator(this.selectors.conversationItemLink).first().click();
-            await this.messagesPage.waitForURL(url =>
-              url.href !== previous && url.pathname.startsWith('/messaging/thread/'));
-            id = threadUrl(this.messagesPage.url());
+            id = await this.switchByClick(item);
           }
         } catch {
           this.cardRetryAt.set(key, now + 120_000);
@@ -284,11 +285,57 @@ export class PlaywrightAdapter implements LinkedInPort {
     }
     return [...reported];
   }
+  private async lastEventUrn(): Promise<string | null> {
+    const events = this.messagesPage.locator(this.selectors.message);
+    const count = await events.count();
+    return count ? events.nth(count - 1).getAttribute('data-event-urn') : null;
+  }
+  // Switches threads like a user would: clicking a card inside the loaded app, with no
+  // full page load. Returns the new thread URL once the message view has really changed;
+  // otherwise it throws, so a stale view of the previous thread is never read as this one.
+  private async switchByClick(item: Locator, expectedPath?: string): Promise<string> {
+    const before = await this.lastEventUrn();
+    const previous = this.messagesPage.url();
+    await item.locator(this.selectors.conversationItemLink).first().click();
+    await this.messagesPage.waitForURL(url => url.href !== previous &&
+      url.pathname.startsWith('/messaging/thread/') &&
+      (expectedPath === undefined || url.pathname === expectedPath));
+    const deadline = Date.now() + SWITCH_SETTLE_MS;
+    while (before !== null && await this.lastEventUrn() === before && Date.now() < deadline) {
+      await delay(150);
+    }
+    if (before !== null && await this.lastEventUrn() === before) {
+      throw new Error('Thread view did not update after switching conversations');
+    }
+    return threadUrl(this.messagesPage.url());
+  }
+  private async openByCard(safe: string): Promise<boolean> {
+    if (!this.messagesPage.url().includes('/messaging/')) return false;
+    const key = [...this.knownThreads].find(([, url]) => url === safe)?.[0];
+    if (!key) return false;
+    const expectedPath = new URL(safe).pathname;
+    for (const item of await this.messagesPage.locator(this.selectors.conversationItem).all()) {
+      const names = await optionalText(item.locator(this.selectors.conversationNames));
+      if (!names || hash(names) !== key) continue;
+      try {
+        await this.switchByClick(item, expectedPath);
+        return true;
+      } catch (error) {
+        if (error instanceof Error && /did not update/.test(error.message)) throw error;
+        return false;
+      }
+    }
+    return false;
+  }
   private async openConversation(id: string): Promise<void> {
     const safe = threadUrl(id);
-    if (this.openThread !== safe) {
-      // Direct navigation is the reliable fallback until SPA switching is live-verified.
-      await this.messagesPage.goto(safe, { waitUntil: 'domcontentloaded' });
+    const onThread = this.openThread === safe &&
+      new URL(this.messagesPage.url()).pathname === new URL(safe).pathname;
+    if (!onThread) {
+      // Full navigation is only a fallback: LinkedIn rejects bursts of direct thread loads.
+      if (!await this.openByCard(safe)) {
+        await this.messagesPage.goto(safe, { waitUntil: 'domcontentloaded' });
+      }
       this.openThread = safe;
     }
     await this.messagesPage.locator(this.selectors.thread).first().waitFor();

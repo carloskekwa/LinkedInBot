@@ -3,7 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Logger } from 'pino';
 import type { Config } from './config.js';
 import { Store } from './storage.js';
-import { safeDetail } from './errors.js';
+import { backoffMs, isHttpRejection, safeDetail } from './errors.js';
 import { hash, timing } from './time.js';
 import type { Action, LinkedInPort, Message, ReplyGenerator, Thread } from './types.js';
 
@@ -140,6 +140,8 @@ export class Bot {
         await this.processThread(id);
       } catch (error) {
         if (this.signal.aborted) throw error;
+        // A rejection by LinkedIn affects every thread: stop the burst, let the worker back off.
+        if (isHttpRejection(error)) throw error;
         // One unreadable thread must not stop the others or trigger a reload storm.
         this.quarantine.set(id, this.now() + THREAD_COOLDOWN_MS);
         this.batches.delete(id);
@@ -225,18 +227,24 @@ export class Bot {
   async run(): Promise<void> {
     const loop = async (worker: string, interval: number, tick: () => Promise<void>) => {
       let failures = 0;
+      let rejected = false;
       while (!this.signal.aborted) {
         const started = performance.now();
         try {
           await tick();
           failures = 0;
+          rejected = false;
         } catch (error) {
           if (this.signal.aborted) break;
           failures++;
-          this.store.heartbeat(worker, 'error', this.now());
+          rejected = isHttpRejection(error);
+          this.store.heartbeat(worker, rejected ? 'rejected_by_linkedin' : 'error', this.now());
           this.log.error({ worker, errorType: error instanceof Error ? error.name : 'unknown',
-            detail: safeDetail(error) },
-            'Worker failed; bounded backoff before retry (external writes are never replayed)');
+            detail: safeDetail(error),
+            pauseSeconds: Math.round(backoffMs(failures, rejected) / 1000) },
+          rejected
+            ? 'LinkedIn rejected page loads (HTTP error, likely throttling). Pausing this worker; do not run other LinkedIn sessions meanwhile'
+            : 'Worker failed; bounded backoff before retry (external writes are never replayed)');
         }
         if (this.now() - this.lastHealthLog >= 300_000) {
           this.lastHealthLog = this.now();
@@ -246,7 +254,7 @@ export class Bot {
           this.lastPrune = this.now();
           this.store.prune(this.now() - this.config.RETENTION_DAYS * 86_400_000);
         }
-        const wait = failures ? Math.min(60_000, 1_000 * 2 ** Math.min(failures, 6)) :
+        const wait = failures ? backoffMs(failures, rejected) :
           Math.max(500, interval * (.8 + Math.random() * .4) - (performance.now() - started));
         try { await delay(wait, undefined, { signal: this.signal }); }
         catch (error) { if (!this.signal.aborted) throw error; }

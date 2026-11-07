@@ -215,8 +215,19 @@ Actual debounce resolution is limited by polling and thread navigation.
 
 The invitation page is refreshed at most once/minute during normal reads, and the
 messaging page at most once/five minutes. This deliberately does not assume a parked
-LinkedIn page always receives updates. Thread switching uses direct navigation as
-the reliable initial implementation, not speculative SPA clicks.
+LinkedIn page always receives updates. Threads are switched by **clicking the
+conversation card inside the loaded app**, as a user would, and the adapter waits for
+the message view to actually change before reading, so it can never read the previous
+thread's messages as the new one. Direct URL navigation is only a fallback: in testing,
+LinkedIn answered a burst of ~12 direct thread loads with HTTP errors
+(`ERR_HTTP_RESPONSE_CODE_FAILURE`).
+
+If LinkedIn does reject page loads, the worker treats it as systemic: it stops
+walking threads, logs a clear error, and pauses for 2, 4, 8 then 10 minutes between
+attempts (resetting on success). A single thread that fails for any other reason is
+skipped for two minutes while the others continue.
+Conversations are identified by participant-name hash; two threads with identical
+participant names are therefore treated as one, which is a known limitation.
 Only rendered conversation-list entries (up to `THREAD_LIMIT`, default 30) and
 currently rendered message history are read. No pagination is implemented.
 Large inboxes, slow navigation, unresolved threads and sequential LLM calls increase
@@ -300,7 +311,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **71 tests in 3 files** passed;
+`npm run typecheck` and `npm run build` passed; all **79 tests in 4 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.

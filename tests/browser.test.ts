@@ -39,7 +39,7 @@ const fixture = `
   <div role="menuitem" hidden>Remove connection</div>
   <ul class="msg-conversations-container__conversations-list">
     <li class="msg-conversation-listitem">
-      <div class="msg-conversation-listitem__link" onclick="history.pushState({}, '', '/messaging/thread/synthetic-1/')">
+      <div class="msg-conversation-listitem__link" onclick="openFixtureThread(1)">
         <span class="msg-conversation-listitem__active-text">Active</span>
         <h3 class="msg-conversation-listitem__participant-names">Synthetic contact</h3>
         <p class="msg-conversation-card__message-snippet">Hello!</p>
@@ -47,7 +47,7 @@ const fixture = `
       </div>
     </li>
     <li class="msg-conversation-listitem">
-      <div class="msg-conversation-listitem__link" onclick="history.pushState({}, '', '/messaging/thread/synthetic-2/')">
+      <div class="msg-conversation-listitem__link" onclick="openFixtureThread(2)">
         <h3 class="msg-conversation-listitem__participant-names">Second contact</h3>
         <p class="msg-conversation-card__message-snippet">Hi</p>
         <time class="msg-conversation-card__time-stamp">Nov 3</time>
@@ -79,6 +79,15 @@ const fixture = `
     <button type="button" class="msg-form__send-toggle">Mode</button>
   </form>
   <script>
+    // Like the real app: the URL changes first, the message list refreshes shortly after.
+    function openFixtureThread(n) {
+      history.pushState({}, '', '/messaging/thread/synthetic-' + n + '/');
+      if (window.__freezeList) return;
+      setTimeout(() => {
+        document.querySelector('.msg-s-event-listitem')
+          .setAttribute('data-event-urn', 'urn:synthetic:incoming-' + n);
+      }, 150);
+    }
     function toggleSend() {
       const form = document.querySelector('form.msg-form');
       const existing = form.querySelector('.msg-form__send-button');
@@ -195,6 +204,36 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
       });
       const second = await port.conversations();
       expect(second).toEqual(['https://www.linkedin.com/messaging/thread/synthetic-1/']);
+    } finally { await port.close(); }
+  });
+  it('switches threads by clicking cards, without a full page load', async () => {
+    const { port, messages } = await adapter();
+    try {
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      await messages.evaluate(() => { (window as unknown as Record<string, unknown>)['__marker'] = 'kept'; });
+      const one = 'https://www.linkedin.com/messaging/thread/synthetic-1/';
+      const two = 'https://www.linkedin.com/messaging/thread/synthetic-2/';
+      await port.conversations();
+      const a = await port.thread(two);
+      const b = await port.thread(one);
+      const c = await port.thread(two);
+      expect(a.supported && b.supported && c.supported).toBe(true);
+      expect(new URL(messages.url()).pathname).toBe('/messaging/thread/synthetic-2/');
+      // A full page load would have reset this window variable.
+      expect(await messages.evaluate(() =>
+        (window as unknown as Record<string, unknown>)['__marker'])).toBe('kept');
+      expect(a.messages[0]?.id).not.toBe(b.messages[0]?.id);
+      expect(a.messages[0]?.id).toBe(c.messages[0]?.id);
+    } finally { await port.close(); }
+  });
+  it('never reads a stale view of the previous thread as the requested one', async () => {
+    const { port, messages } = await adapter();
+    try {
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      await port.conversations();
+      await messages.evaluate(() => { (window as unknown as Record<string, unknown>)['__freezeList'] = true; });
+      await expect(port.thread('https://www.linkedin.com/messaging/thread/synthetic-1/'))
+        .rejects.toThrow('did not update');
     } finally { await port.close(); }
   });
   it('classifies incoming/own messages and verifies a new send after the inbound anchor', async () => {
