@@ -112,6 +112,10 @@ Replies: the system prompt asks the model to reply to every message from a perso
 (including greetings, thanks, emoji-only and empty messages) and to decline only on an
 explicit request to stop or an obvious automated notification. Run with
 `LOG_LEVEL=debug` to see the model's decision and reason (this may echo message text).
+To see exactly what the AI would answer, set `LOG_MESSAGE_TEXT=true` in your private
+`.env`: each reply then logs an `AI answer` line with the incoming message(s)
+(truncated to 500 characters each), the AI's answer and its reason. This is **private
+data** in your terminal/logs; leave it off for normal and submission runs.
 
 ## Keeping it running
 
@@ -331,7 +335,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **84 tests in 4 files** passed;
+`npm run typecheck` and `npm run build` passed; all **85 tests in 4 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.

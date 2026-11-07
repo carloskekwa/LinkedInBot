@@ -35,6 +35,8 @@ const schema = z.object({
   LLM_API_KEY: z.string().trim().default(''),
   LLM_TIMEOUT_MS: positive(15_000),
   ALLOW_EXTERNAL_LLM: bool.default(false),
+  // Logs incoming message text and the AI's answer. Private data: for local debugging only.
+  LOG_MESSAGE_TEXT: bool.default(false),
   SYSTEM_PROMPT: z.string().default('./prompts/system.md'),
   FALLBACK_REPLY: z.string().min(1).max(300).default(
     "I'm the account owner's automated assistant, and I can't answer that reliably right now.",

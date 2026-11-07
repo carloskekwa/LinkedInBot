@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pino } from 'pino';
+import { pino, type Logger } from 'pino';
 import { loadConfig } from '../src/config.js';
 import { Bot, incomingBatch } from '../src/runtime.js';
 import { Store } from '../src/storage.js';
@@ -20,7 +20,7 @@ afterEach(() => {
   dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true }));
   vi.restoreAllMocks();
 });
-function setup(overrides: Partial<Config> = {}, live = true) {
+function setup(overrides: Partial<Config> = {}, live = true, logger: Logger = log) {
   const config = { ...loadConfig({
     ALLOW_EXTERNAL_LLM: 'true',
     INITIAL_HISTORY: 'reply-latest', DEBOUNCE_MS: '7', MAX_DEBOUNCE_MS: '20',
@@ -33,7 +33,7 @@ function setup(overrides: Partial<Config> = {}, live = true) {
   const generate = vi.fn<ReplyGenerator['generate']>().mockResolvedValue({
     should_reply: true, reply: 'How can I help?', language: 'en', reason: 'test',
   });
-  const bot = new Bot(fake, store, { generate }, config, log, live, controller.signal, () => clock);
+  const bot = new Bot(fake, store, { generate }, config, logger, live, controller.signal, () => clock);
   return { config, store, fake, bot, generate, controller,
     advance: (ms = 10) => { clock += ms; }, now: () => clock };
 }
@@ -90,6 +90,39 @@ describe('action orchestration', () => {
   it('still stops promptly when aborted during thread processing', async () => {
     const s = setup(); s.controller.abort();
     await expect(s.bot.messageTick()).rejects.toThrow();
+  });
+  it('logs incoming text and the AI answer only when LOG_MESSAGE_TEXT is on', async () => {
+    const capture = () => {
+      const lines: string[] = [];
+      return { lines, logger: pino({ level: 'info' }, { write: (line: string) => { lines.push(line); } }) };
+    };
+    const off = capture();
+    const quiet = setup({}, false, off.logger);
+    quiet.fake.threads.get('t')!.messages[0]!.text = 'Hello from a synthetic sender';
+    quiet.generate.mockResolvedValue({ should_reply: true, reply: 'Synthetic answer text',
+      language: 'en', reason: 'greeting' });
+    await reply(quiet);
+    expect(off.lines.join('')).toContain('Dry-run: would reply');
+    expect(off.lines.join('')).not.toContain('Synthetic answer text');
+    expect(off.lines.join('')).not.toContain('Hello from a synthetic sender');
+
+    const on = capture();
+    const loud = setup({ LOG_MESSAGE_TEXT: true }, false, on.logger);
+    loud.fake.threads.get('t')!.messages[0]!.text = 'Hello from a synthetic sender';
+    loud.generate.mockResolvedValue({ should_reply: true, reply: 'Synthetic answer text',
+      language: 'en', reason: 'greeting' });
+    await reply(loud);
+    const entry = JSON.parse(on.lines.find(l => l.includes('AI answer'))!);
+    expect(entry).toMatchObject({ aiAnswer: 'Synthetic answer text', shouldReply: true,
+      incomingMessages: ['Hello from a synthetic sender'] });
+    expect(loud.fake.sent).toHaveLength(0);
+
+    const declined = capture();
+    const quietModel = setup({ LOG_MESSAGE_TEXT: true }, false, declined.logger);
+    quietModel.generate.mockResolvedValue({ should_reply: false, reply: '', language: 'en', reason: 'stop request' });
+    await reply(quietModel);
+    expect(JSON.parse(declined.lines.find(l => l.includes('AI answer'))!))
+      .toMatchObject({ aiAnswer: null, aiReason: 'stop request' });
   });
   it('baselines existing history by default then replies to a new message', async () => {
     const s = setup({ INITIAL_HISTORY: 'baseline' });
