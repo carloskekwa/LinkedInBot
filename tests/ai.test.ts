@@ -199,6 +199,39 @@ describe('configuration and LLM contract', () => {
       const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
       expect(retryBody.messages[0].content).toContain('not in the approved facts');
     });
+    it.each(['are you a bot ?', 'Are you a bot?', 'r u a bot', 'Are you real?', 'is this an AI?',
+      'Am I talking to a human?', 'are you actually a person?', 'Is this really you?'])(
+      'answers "%s" honestly without a model call', async question => {
+        const { fetchMock, result } = run([], question);
+        const reply = await result();
+        expect(reply.reply).toContain('automated assistant');
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+    it('does not treat ordinary questions as automation questions', async () => {
+      const { fetchMock, result } = run([completion(draft('Sure, go ahead.'))], 'are you available for a quick question?');
+      expect((await result()).reply).toBe('Sure, go ahead.');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    it('flags any draft that denies being automated or claims to be a person', () => {
+      for (const text of ['No, I\'m not a bot!', 'I\'m a real person.', 'I am human.', 'Nope, not a bot.',
+        'This is not automated.', 'I\u2019m definitely not an AI.', 'No, I\'m a real person, promise.']) {
+        expect(reviewReply(text), text).toMatchObject({ hard: true, rule: 'automation-denial' });
+      }
+      expect(reviewReply('Yes, this is an automated assistant replying on their behalf.')).toBeNull();
+    });
+    it('never lets a model denial through when the question is longer than the plain form', async () => {
+      const { result } = run([completion(draft('No, I\'m not a bot, just a real person!')),
+        completion(draft('Nope, I\'m a real person.'))],
+      'Hi there, quick one before we continue: are you a bot, or am I talking to you?');
+      const reply = await result();
+      expect(reply.reply).toContain('automated assistant');
+      expect(reply.reply).not.toMatch(/real person|not a bot/i);
+    });
+    it('does not send a disclosure line for an unprompted denial', async () => {
+      const { result } = run([completion(draft('I\'m a real person.')), completion(draft('I\'m a real person.'))],
+        'what do you think of the new release?');
+      await expect(result()).rejects.toThrow();
+    });
     it('rejects denials of experience in every phrasing, even when facts are listed', () => {
       const facts = ['I work as a mobile engineer using Swift, Java and Spring Boot.'];
       for (const text of ['I don\'t have experience with Golang specifically.', 'I haven\'t used Go.',
@@ -352,7 +385,7 @@ describe('configuration and LLM contract', () => {
           completion(draft('I live in Paris.'))], incoming);
         await expect(result()).rejects.toThrow('unsupported claim');
       });
-    it.each(['hi, where do you work?', 'Please stop messaging me.', 'Are you a bot?'])(
+    it.each(['hi, where do you work?', 'Please stop messaging me.'])(
       'does not turn %s into a greeting after persistent owner claims', async incoming => {
         const { result } = run([completion(draft('I live in London.')),
           completion(draft('I live in Paris.'))], incoming);

@@ -39,6 +39,9 @@ const schema = z.object({
   ALLOW_EXTERNAL_LLM: bool.default(false),
   // Logs incoming message text and the AI's answer. Private data: for local debugging only.
   LOG_MESSAGE_TEXT: bool.default(false),
+  // Prints only {incomingMessages, aiAnswer} per reply and hides info/debug logs (warnings and
+  // errors still show). Private data: for local debugging and sharing test results.
+  LOG_CONVERSATION_ONLY: bool.default(false),
   SYSTEM_PROMPT: z.string().default('./prompts/system.md'),
   // Private facts the bot may state about the owner (gitignored). Optional.
   OWNER_FACTS_FILE: z.string().default('./prompts/owner-facts.md'),

@@ -124,6 +124,23 @@ describe('action orchestration', () => {
     expect(JSON.parse(declined.lines.find(l => l.includes('AI answer'))!))
       .toMatchObject({ aiAnswer: null, aiReason: 'stop request' });
   });
+  it('LOG_CONVERSATION_ONLY prints just the incoming messages and the AI answer', async () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const lines: string[] = [];
+      const logger = pino({ level: 'warn' }, { write: (line: string) => { lines.push(line); } });
+      const s = setup({ LOG_CONVERSATION_ONLY: true }, false, logger);
+      s.fake.threads.get('t')!.messages[0]!.text = 'Hello from a synthetic sender';
+      s.generate.mockResolvedValue({ should_reply: true, reply: 'Synthetic answer text',
+        language: 'en', reason: 'private reason' });
+      await reply(s);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(spy.mock.calls[0]![0]))).toEqual({
+        incomingMessages: ['Hello from a synthetic sender'], aiAnswer: 'Synthetic answer text' });
+      expect(lines.join('')).not.toContain('Synthetic answer text');
+      expect(s.fake.sent).toHaveLength(0);
+    } finally { spy.mockRestore(); }
+  });
   it('baselines existing history by default then replies to a new message', async () => {
     const s = setup({ INITIAL_HISTORY: 'baseline' });
     await reply(s); expect(s.fake.sent).toHaveLength(0);

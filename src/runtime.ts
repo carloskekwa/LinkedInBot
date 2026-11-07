@@ -185,7 +185,13 @@ export class Bot {
     this.log.debug({ ref: hash(id), shouldReply: reply.should_reply, language: reply.language,
       reason: reply.reason, llmMs }, 'Model decision');
     const generatedAt = this.now();
-    if (this.config.LOG_MESSAGE_TEXT) {
+    if (this.config.LOG_CONVERSATION_ONLY) {
+      // Compact view for sharing: just the sender's messages and the AI's proposed answer.
+      console.log(JSON.stringify({
+        incomingMessages: incoming.map(m => (m.text || (m.attachment ? '[attachment]' : '[empty]')).slice(0, 500)),
+        aiAnswer: reply.should_reply ? reply.reply : null,
+      }));
+    } else if (this.config.LOG_MESSAGE_TEXT) {
       // Field names avoid the logger's redaction list ("text", "reply") on purpose.
       this.log.info({
         ref: hash(id), shouldReply: reply.should_reply, language: reply.language, llmMs,

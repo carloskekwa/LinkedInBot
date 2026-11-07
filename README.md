@@ -116,6 +116,12 @@ To see exactly what the AI would answer, set `LOG_MESSAGE_TEXT=true` in your pri
 `.env`: each reply then logs an `AI answer` line with the incoming message(s)
 (truncated to 500 characters each), the AI's answer and its reason. This is **private
 data** in your terminal/logs; leave it off for normal and submission runs.
+For a compact test view, set `LOG_CONVERSATION_ONLY=true`: each decision prints only
+`incomingMessages` and `aiAnswer` (`null` when no reply is proposed). This takes precedence
+over `LOG_MESSAGE_TEXT` and hides info/debug logs, while warnings and errors remain
+visible. It still exposes private message text; disable it for normal and submission runs.
+Short recognized English automation questions receive an honest disclosure without a
+model call. Drafts denying automation or claiming to be human are rejected.
 
 ## Keeping it running
 

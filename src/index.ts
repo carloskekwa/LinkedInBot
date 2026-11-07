@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   }
   if (args[0] === '--demo') { await demo(log); return; }
   const config = loadConfig();
-  log.level = config.LOG_LEVEL;
+  log.level = config.LOG_CONVERSATION_ONLY && config.LOG_LEVEL !== 'error' ? 'warn' : config.LOG_LEVEL;
   const dataDir = resolve(config.DATA_DIR);
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   chmodSync(dataDir, 0o700);

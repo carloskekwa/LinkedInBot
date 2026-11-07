@@ -50,9 +50,26 @@ const COMMITMENT = new RegExp([
   '\\bi\'?m (?:currently\\s+)?(?:looking for|available|open)\\b',
 ].join('|'), 'i');
 export interface ReplyIssue {
-  rule: 'commitment' | 'owner-claim' | 'support-bot-style' | 'greeting-context' | 'smalltalk-context';
+  rule: 'commitment' | 'owner-claim' | 'support-bot-style' | 'greeting-context' | 'smalltalk-context' |
+    'automation-denial';
   message: string; hard: boolean; safeReply?: string;
 }
+// A short message that is only asking whether the sender is talking to a bot/AI/real person.
+const BOT_QUESTION = new RegExp([
+  '\\b(?:are|r)\\s+(?:you|u)\\s+(?:a\\s+|an\\s+|really\\s+|actually\\s+)*(?:bot|robot|chatbot|ai|a\\.i\\.|automated|automatic|real|human|person|machine|chatgpt|gpt)\\b',
+  '\\bis\\s+this\\s+(?:a\\s+|an\\s+)?(?:bot|robot|chatbot|ai|automated|automatic|real|human|person|machine)\\b',
+  '\\b(?:am\\s+i|are\\s+we)\\s+(?:talking|speaking|chatting|messaging|writing)\\s+(?:to|with)\\s+(?:a\\s+|an\\s+)?(?:bot|robot|chatbot|ai|human|real|person|machine|someone real)\\b',
+  '\\bis\\s+(?:this|that)\\s+(?:really|actually)\\s+you\\b',
+].join('|'), 'i');
+// Honest, natural answer to a sincere "are you a bot?". Never claims to be human.
+const DISCLOSURE_REPLY = 'Yes, this is an automated assistant replying on their behalf. What\'s on your mind?';
+// A draft that denies being automated or claims to be a person is never acceptable.
+const AUTOMATION_DENIAL = new RegExp([
+  '\\b(?:i\'?m|i am|this is|it\'?s)\\s+(?:definitely\\s+|really\\s+|actually\\s+)?not\\s+(?:a\\s+|an\\s+)?(?:bot|robot|chatbot|ai|automated|automatic|machine|assistant)\\b',
+  '\\b(?:i\'?m|i am|this is)\\s+(?:definitely\\s+|really\\s+|actually\\s+|just\\s+)?(?:a\\s+|an\\s+)?(?:real|actual|living)\\s+(?:person|human)\\b',
+  '\\b(?:i\'?m|i am)\\s+(?:a\\s+)?(?:human|person)\\b', '\\bno,?\\s+(?:i\'?m|i am)\\s+(?:a\\s+)?(?:real|human|person)\\b',
+  '\\bnot\\s+(?:a\\s+|an\\s+)?(?:bot|robot|ai|automated)\\b',
+].join('|'), 'i');
 // Neutral lines that make no claim and no commitment, used if a rewrite still breaks a rule.
 const SAFE_COMMITMENT = 'Could you share a few more details?';
 const GREETING = /^(?:hi|hello|hey(?: there)?|good morning|good afternoon|good evening)[.!?]*$/i;
@@ -127,6 +144,11 @@ export function ownerClaimIssue(reply: string, facts: string[]): string | null {
 }
 export function reviewReply(reply: string, facts: string[] = []): ReplyIssue | null {
   const text = reply.replace(/[\u2018\u2019]/g, '\'');
+  if (AUTOMATION_DENIAL.test(text)) {
+    return { rule: 'automation-denial', hard: true, safeReply: DISCLOSURE_REPLY,
+      message: 'it denied being automated or claimed to be a person. This is an automated assistant: ' +
+        'never deny that, and answer honestly if asked' };
+  }
   if (COMMITMENT.test(text)) {
     return { rule: 'commitment', message: 'it expressed interest or a commitment on the owner\'s behalf', hard: true,
       safeReply: SAFE_COMMITMENT };
@@ -167,6 +189,14 @@ export class LlmGenerator implements ReplyGenerator {
     }));
     const omitted = Math.max(0, messages.length - context.length);
     const latest = messages.at(-1);
+    const asksIfBot = !!latest && !latest.own &&
+      BOT_QUESTION.test(latest.text.replace(/[\u2018\u2019]/g, '\''));
+    // A short, plain "are you a bot?" gets the honest answer directly: no model call, no risk of a denial.
+    if (asksIfBot && latest.text.trim().length <= 80) {
+      this.log.debug('Sincere automation question; using the honest disclosure reply');
+      return { should_reply: true, reply: DISCLOSURE_REPLY, language: 'en',
+        reason: 'honest disclosure: asked whether this is automated' };
+    }
     const greeting = latest && !latest.own && !latest.attachment && GREETING.test(latest.text.trim());
     const latestText = latest && !latest.own && !latest.attachment
       ? latest.text.trim().replace(/[\u2018\u2019]/g, '\'') : '';
@@ -203,7 +233,8 @@ export class LlmGenerator implements ReplyGenerator {
       }
       if (attempt === 2) {
         if (!issue.hard) return reply;
-        const safeReply = smallTalkReply ?? issue.safeReply;
+        const safeReply = smallTalkReply ??
+          (issue.rule === 'automation-denial' && !asksIfBot ? undefined : issue.safeReply);
         // Only recognized English small talk or a commitment has a contextual neutral substitute.
         if (safeReply && /^en\b/i.test(reply.language)) {
           this.log.warn({ hard: true, rule: issue.rule }, 'Rewrite still broke a rule; using a neutral substitute');
