@@ -58,7 +58,7 @@ async function adapter() {
   const messages = await context.newPage();
   await messages.goto('https://www.linkedin.com/feed/');
   const port = new PlaywrightAdapter(context, invitations, messages,
-    loadConfig(), pino({ level: 'silent' }));
+    loadConfig({ ALLOW_EXTERNAL_LLM: 'true' }), pino({ level: 'silent' }));
   await port.initialize();
   return { port, invitations, messages };
 }

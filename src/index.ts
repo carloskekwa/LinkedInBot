@@ -49,6 +49,8 @@ async function main(): Promise<void> {
   if (live && !config.ACKNOWLEDGE_PLATFORM_RISK) {
     throw new Error('Live mode requires ACKNOWLEDGE_PLATFORM_RISK=true; read README first');
   }
+  const generator = args[0] === '--login' || args[0] === '--smoke'
+    ? undefined : new LlmGenerator(config, loadPrompt(config), log);
   mkdirSync(resolve(config.BROWSER_PROFILE), { recursive: true, mode: 0o700 });
   chmodSync(resolve(config.BROWSER_PROFILE), 0o700);
   const unlock = acquireLock(join(resolve(config.BROWSER_PROFILE), 'assistant.lock'));
@@ -79,7 +81,7 @@ async function main(): Promise<void> {
     }
     store = new Store(join(dataDir, live ? 'bot.db' : 'dry-run.db'));
     store.bindOwner(adapter.ownerIdentity());
-    const generator = new LlmGenerator(config, loadPrompt(config), log);
+    if (!generator) throw new Error('Reply generator missing for bot mode');
     const bot = new Bot(adapter, store, generator, config, log, live, controller.signal);
     log.info({ live, initialHistory: config.INITIAL_HISTORY,
       invitationPollMs: config.INVITATION_POLL_MS, messagePollMs: config.MESSAGE_POLL_MS },

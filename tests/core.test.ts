@@ -22,6 +22,7 @@ afterEach(() => {
 });
 function setup(overrides: Partial<Config> = {}, live = true) {
   const config = { ...loadConfig({
+    ALLOW_EXTERNAL_LLM: 'true',
     INITIAL_HISTORY: 'reply-latest', DEBOUNCE_MS: '7', MAX_DEBOUNCE_MS: '20',
   }), ...overrides };
   const store = new Store(':memory:'); stores.push(store);
@@ -247,7 +248,7 @@ describe('durable state and timing', () => {
     const fake = new FakeAdapter();
     fake.threads.set('t', { id: 't', supported: true, messages: [syntheticMessage('m1')] });
     const generate = vi.fn<ReplyGenerator['generate']>();
-    const bot = new Bot(fake, store, { generate }, loadConfig(), log, true,
+    const bot = new Bot(fake, store, { generate }, loadConfig({ ALLOW_EXTERNAL_LLM: 'true' }), log, true,
       new AbortController().signal);
     await bot.messageTick();
     expect(fake.sent).toHaveLength(0);

@@ -55,7 +55,8 @@ export const syntheticMessage = (id: string, text = 'Hello!'): Message => ({
   receipt: { at: 1_700_000_000_000, precision: 'exact', uncertaintyMs: 0 },
 });
 export async function demo(log: Logger): Promise<void> {
-  const config = loadConfig({ DEBOUNCE_MS: '1', MAX_DEBOUNCE_MS: '1',
+  const config = loadConfig({ LLM_BASE_URL: 'http://127.0.0.1:11434/v1',
+    DEBOUNCE_MS: '1', MAX_DEBOUNCE_MS: '1',
     INITIAL_HISTORY: 'reply-latest' });
   const store = new Store(':memory:');
   try {

@@ -27,7 +27,11 @@ export function guardReply(value: unknown, context: Message[]): Reply {
   return parsed;
 }
 export class LlmGenerator implements ReplyGenerator {
-  constructor(private config: Config, private system: string, private log: Logger) {}
+  constructor(private config: Config, private system: string, private log: Logger) {
+    if (new URL(config.LLM_BASE_URL).hostname === 'api.openai.com' && !config.LLM_API_KEY) {
+      throw new Error('OpenAI requires LLM_API_KEY in your private .env file');
+    }
+  }
   async generate(messages: Message[], signal: AbortSignal): Promise<Reply> {
     const context = messages.slice(-this.config.CONTEXT_MESSAGES).map(m => ({
       sender: m.own ? 'owner' : 'incoming',

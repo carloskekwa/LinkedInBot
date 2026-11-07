@@ -33,13 +33,27 @@ npm run build
 cp .env.example .env
 ```
 
-Edit `.env`. Defaults use a **local** OpenAI-compatible server at
-`http://127.0.0.1:11434/v1` and model `llama3.2`; the server and model are not bundled.
-Install/start a compatible local model server separately and ensure the selected
-model supports the JSON output contract in [the system prompt](prompts/system.md).
-For a remote HTTPS provider, set `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` and
-`ALLOW_EXTERNAL_LLM=true` **only after consenting to transmission of private
-conversation text and reviewing that provider's retention policy**.
+Edit `.env`. Defaults use **OpenAI's API** at `https://api.openai.com/v1`
+with model `gpt-4o-mini`. Set `LLM_API_KEY` to your own OpenAI API key locally.
+No local model/server installation is needed. API usage requires available access
+and billing/quota on your OpenAI API account.
+
+```dotenv
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+LLM_API_KEY=your_openai_api_key
+ALLOW_EXTERNAL_LLM=true
+```
+
+The example explicitly enables external inference: **conversation context is sent
+to OpenAI**. Review the provider's retention policy before use. Without an explicit
+`ALLOW_EXTERNAL_LLM=true`, configuration rejects remote inference. Missing OpenAI
+keys fail before the bot opens its browser; login/smoke do not require a model key.
+Never paste a real key into chat, documentation or Git.
+
+Alternative OpenAI-compatible providers remain supported through the same variables.
+For local inference, explicitly set a local endpoint and model and set
+`ALLOW_EXTERNAL_LLM=false`; a local server is not bundled.
 Redirects are disabled to avoid forwarding credentials to a different endpoint.
 
 ```sh
@@ -271,7 +285,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **59 tests in 3 files** passed;
+`npm run typecheck` and `npm run build` passed; all **61 tests in 3 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.
@@ -297,7 +311,7 @@ linguistic quality or injection resistance. CI installs Chromium before running 
 
 ### Required manual live checklist
 
-1. Review platform permission/risk and model privacy. Start a local model endpoint.
+1. Review platform permission/risk and OpenAI privacy. Configure your API key and quota.
 2. Run login and smoke. Check owner identity, single-recipient detection and all
    read/write selectors in [selectors.ts](src/selectors.ts) against the current UI.
    JSON overrides can be supplied using `SELECTORS_FILE` with matching keys.
@@ -327,7 +341,7 @@ linguistic quality or injection resistance. CI installs Chromium before running 
 - Locked profile: stop the other bot/login/PM2 process. A dead PID lock is recovered;
   invalid/permission-conflicted locks require manual inspection. Never remove an
   active process's lock.
-- LLM unavailable/invalid output: inspect local server/model/configuration. Incident
+- LLM unavailable/invalid output: inspect API key, provider quota, model access and configuration. Incident
   logs omit arbitrary provider bodies to avoid exposing private information.
 - Checkpoint/login redirect: resolve manually in Chromium; both workers pause for
   recognized checkpoints. Shared login cookies allow workers to restore their own

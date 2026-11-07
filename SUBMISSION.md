@@ -10,7 +10,9 @@ No outgoing invitations, unsolicited new conversations or bulk outreach.
 
 Use a supported Node release and a logged-in desktop:
 `npm ci`, `npx playwright install chromium`, `npm run build`.
-Copy `.env.example` to `.env` and configure an OpenAI-compatible model endpoint.
+Copy `.env.example` to `.env` and add your private OpenAI API key as `LLM_API_KEY`.
+Defaults use OpenAI's `gpt-4o-mini`; conversation context is sent to OpenAI with
+`ALLOW_EXTERNAL_LLM=true`. No local model server is required.
 Review platform-policy risk and model privacy. Run `npm run login`, then
 `npm run smoke:live` and `npm run start:dry`.
 After live selector validation, explicitly acknowledge platform risk in configuration
@@ -28,6 +30,6 @@ groups, InMail and unidentified threads are skipped. Rendered history/conversati
 lists are bounded and UI-dependent. Manual re-login is required for checkpoints.
 Exactly-once delivery and 24-hour uninterrupted operation are not guaranteed.
 LinkedIn restricts this type of automation and may restrict the account.
-All 59 offline tests, the build and runtime/test type checks passed.
+All 61 offline tests, the build and runtime/test type checks passed.
 Source: https://github.com/carloskekwa/LinkedInBot.
 No live performance figures are claimed here.
