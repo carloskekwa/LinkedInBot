@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { pino } from 'pino';
-import { loadConfig, loadPrompt } from './config.js';
+import { loadConfig, loadOwnerFacts, loadPrompt } from './config.js';
 import { PlaywrightAdapter } from './browser.js';
 import { LlmGenerator } from './ai.js';
 import { Store } from './storage.js';
@@ -51,8 +51,19 @@ async function main(): Promise<void> {
   if (live && !config.ACKNOWLEDGE_PLATFORM_RISK) {
     throw new Error('Live mode requires ACKNOWLEDGE_PLATFORM_RISK=true; read README first');
   }
-  const generator = ['--login', '--smoke', '--inspect'].includes(args[0]!)
-    ? undefined : new LlmGenerator(config, loadPrompt(config), log);
+  const needsAi = !['--login', '--smoke', '--inspect'].includes(args[0]!);
+  const owner = needsAi ? loadOwnerFacts(config.OWNER_FACTS_FILE) : { facts: [], skipped: 0 };
+  const generator = needsAi ? new LlmGenerator(config, loadPrompt(config), log, owner.facts) : undefined;
+  if (generator) {
+    if (owner.facts.length > 0) {
+      log.info({ facts: owner.facts.length, ignoredPlaceholderLines: owner.skipped },
+        'Owner facts loaded: the bot may state these about you');
+    } else {
+      log.warn({ ignoredPlaceholderLines: owner.skipped },
+        'No owner facts: questions about you (job, employer, location) get a "see my profile" answer. ' +
+        'Copy prompts/owner-facts.example.md to prompts/owner-facts.md and fill it in to change that');
+    }
+  }
   mkdirSync(resolve(config.BROWSER_PROFILE), { recursive: true, mode: 0o700 });
   chmodSync(resolve(config.BROWSER_PROFILE), 0o700);
   const unlock = acquireLock(join(resolve(config.BROWSER_PROFILE), 'assistant.lock'));

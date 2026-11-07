@@ -1,12 +1,47 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pino } from 'pino';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, loadOwnerFacts, loadPrompt } from '../src/config.js';
 import { guardReply, LlmGenerator, reviewReply } from '../src/ai.js';
 import { syntheticMessage } from '../src/demo.js';
 
 afterEach(() => vi.unstubAllGlobals());
 const valid = { should_reply: true, reply: 'Hello!', language: 'en', reason: 'greeting' };
 describe('configuration and LLM contract', () => {
+  it('loads owner facts, ignoring comments and unfinished <placeholder> lines', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'facts-test-'));
+    try {
+      const file = join(dir, 'facts.md');
+      writeFileSync(file, [
+        '# comment', '', '- I work at Example Corp as an engineer.', '* I am based in Exampleville.',
+        '- My name is <first name>.', 'I like synthetic data.',
+      ].join('\n'));
+      expect(loadOwnerFacts(file)).toEqual({
+        facts: ['I work at Example Corp as an engineer.', 'I am based in Exampleville.',
+          'I like synthetic data.'], skipped: 1 });
+      expect(loadOwnerFacts(join(dir, 'missing.md'))).toEqual({ facts: [], skipped: 0 });
+      expect(loadOwnerFacts('')).toEqual({ facts: [], skipped: 0 });
+      writeFileSync(file, '- ' + 'x'.repeat(2_100));
+      expect(() => loadOwnerFacts(file)).toThrow('too long');
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  it('appends facts to the prompt only when present, and ships an unfilled example', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'facts-test-'));
+    try {
+      const base = loadPrompt(loadConfig({ ALLOW_EXTERNAL_LLM: 'true', OWNER_FACTS_FILE: join(dir, 'none.md') }));
+      expect(base).not.toContain('FACTS ABOUT THE OWNER (');
+      const file = join(dir, 'facts.md');
+      writeFileSync(file, '- I work at Example Corp.\n');
+      const withFacts = loadPrompt(loadConfig({ ALLOW_EXTERNAL_LLM: 'true', OWNER_FACTS_FILE: file }));
+      expect(withFacts.startsWith(base)).toBe(true);
+      expect(withFacts).toContain('FACTS ABOUT THE OWNER (approved by the owner');
+      expect(withFacts).toContain('- I work at Example Corp.');
+      // The committed example is all placeholders, so copying it unedited yields no facts.
+      expect(loadOwnerFacts('./prompts/owner-facts.example.md').facts).toEqual([]);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
   it('validates explicit owner identity as a LinkedIn profile URL', () => {
     const env = { ALLOW_EXTERNAL_LLM: 'true' };
     expect(loadConfig({ ...env, OWNER_PROFILE_URL: 'https://www.linkedin.com/in/synthetic-owner/' })
@@ -98,18 +133,93 @@ describe('configuration and LLM contract', () => {
     it('flags commitments and support-bot phrasing, including curly apostrophes', () => {
       for (const text of ['I\u2019d love to hear more.', 'I\'m interested in the role', 'Count me in!',
         'I will definitely join', 'I\u2019ll be there', 'I\'d be interested to hear more',
-        'I would be happy to chat', 'I\u2019m open to that']) {
+        'I\'ve been in the industry for about 10 years now.', 'I\'m always interested in hearing about new opportunities!',
+        'I\'m always open to hearing about interesting opportunities!', 'Not at the moment, but thanks for asking!',
+        'I\'m currently looking for something new.', 'I\'m not looking right now.', 'I would be happy to chat',
+        'I\u2019m open to that', 'I\'m happy to help with any questions about React Native!',
+        'I\'m happy to chat about my role', 'I\'m glad to meet', 'I\'m excited to connect']) {
         expect(reviewReply(text), text).toMatchObject({ hard: true });
+      }
+      // Denials, adverbs, profile-content claims and experience claims are all unsupported.
+      for (const text of ['I don\'t focus on React Native specifically.', 'I don\'t specifically work with React Native.',
+        'React Native isn\'t something I specifically work with.', 'I\'ve got over 10 years of experience in the field.',
+        'I have several years of experience in mobile engineering.', 'I have years of experience.',
+        'I\'ve been doing this for about 5 years.',
+        'It\'s not something I focus on, but you can check my profile.', 'It\u2019s not something I specialize in.',
+        'I\'m based in the UK. What about you?', 'I live in NY.',
+        'It\'s mentioned on my profile if you want to check it out.', 'It\'s listed in my profile.',
+        'I\'ve worked with Kotlin for a while.', 'My role is leading a team.']) {
+        expect(reviewReply(text, ['I work at Example Corp as a mobile engineer.']), text).toMatchObject({ hard: true });
       }
       for (const text of ['How can I assist you today?', 'What can I help you with?',
         'Thank you for reaching out!', 'Feel free to ask', 'I\'m here to help with your questions!',
-        'I\'ll do my best to help.', 'I understand it can be frustrating.']) {
+        'I\'ll do my best to help.', 'I understand it can be frustrating.', 'I can\'t share that here.']) {
         expect(reviewReply(text), text).toMatchObject({ hard: false });
       }
       for (const text of ['Hey! What\'s up?', 'Could you share a few details?', '\ud83d\udc4d', 'Anytime!',
         'Sure, go ahead.', 'Thanks! Glad it landed.', 'Not something I can answer properly here.']) {
         expect(reviewReply(text), text).toBeNull();
       }
+    });
+    it('rejects claims about the owner that the approved facts do not support', () => {
+      const none: string[] = [];
+      const facts = ['I work at Example Corp as a mobile engineer.', 'I am based in Exampleville.'];
+      // Real fabrications observed from the model.
+      for (const text of ['I\'m based in London. What about you?',
+        'I\'m based in the San Francisco Bay Area. Where are you located?',
+        'I don\'t work with React Native, but it\'s a popular choice!',
+        'I work at Acme Inc as a designer.', 'I\'m a software architect.',
+        'I have 10 years of experience.', 'I specialize in backend systems.',
+        'I primarily work as a mobile engineer, but I don\u2019t specialize in React Native.']) {
+        expect(reviewReply(text, text.includes('mobile engineer') ? facts : none), text)
+          .toMatchObject({ hard: true });
+      }
+      expect(reviewReply('I work at Example Corp as a mobile engineer, focusing on React Native.', facts))
+        .toMatchObject({ hard: true });
+    });
+    it('accepts claims that match the facts, questions, disclosure and ordinary talk', () => {
+      expect(reviewReply('I\'m based in the UK.', ['I am based in the UK.'])).toBeNull();
+      expect(reviewReply('I work in NY as a designer.', ['I work in NY as a designer.'])).toBeNull();
+      const facts = ['I work at Example Corp as a mobile engineer.', 'I am based in Exampleville.'];
+      for (const text of ['I work at Example Corp as a mobile engineer.', 'I\u2019m based in Exampleville. Where are you?',
+        'I\'m a mobile engineer at Example Corp.', 'Yes, this is an automated assistant replying on their behalf.',
+        'I\'m an automated assistant.', 'I\'m a bit unsure about that one.',
+        'It\'s on my profile if you want to take a look.', 'Hey! What\'s up?',
+        'Are you focusing on mobile these days?', 'What are you working on right now?',
+        'Where are you based?', 'Thanks! Glad it landed.']) {
+        expect(reviewReply(text, facts), text).toBeNull();
+      }
+    });
+    it('asks for a rewrite when the first draft invents facts, and uses the compliant one', async () => {
+      const { fetchMock, result } = run([
+        completion(draft('I\'m based in London. What about you?')),
+        completion(draft('It\'s on my profile if you want to take a look.')),
+      ]);
+      expect((await result()).reply).toBe('It\'s on my profile if you want to take a look.');
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]![1]!.body));
+      expect(retryBody.messages[0].content).toContain('not in the approved facts');
+    });
+    it('never sends an invented fact: persistent claims get a neutral English line', async () => {
+      const { result } = run([completion(draft('I\'m based in London.')),
+        completion(draft('I live in Paris.'))]);
+      const reply = await result();
+      expect(reply.reply).toBe('It\'s on my profile if you want to take a look.');
+      expect(reply.reason).toContain('neutral substitute');
+    });
+    it('uses the generic fallback (throws) when a persistent violation is not in English', async () => {
+      const fr = (reply: string) => completion(JSON.stringify({ ...valid, language: 'fr', reply }));
+      const { result } = run([fr('I\'m based in London.'), fr('I live in Paris.')]);
+      await expect(result()).rejects.toThrow('unsupported claim');
+    });
+    it('uses the owner facts passed to the generator', async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+        completion(draft('I\'m based in Exampleville.')));
+      vi.stubGlobal('fetch', fetchMock);
+      const withFacts = new LlmGenerator(loadConfig({ ALLOW_EXTERNAL_LLM: 'true', LLM_API_KEY: 'synthetic-test-key' }),
+        'test system', pino({ level: 'silent' }), ['I am based in Exampleville.']);
+      expect((await withFacts.generate([syntheticMessage('m', 'where are you based?')],
+        new AbortController().signal)).reply).toBe('I\'m based in Exampleville.');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
     it('asks for exactly one rewrite and uses it', async () => {
       const { fetchMock, result } = run([
@@ -132,7 +242,8 @@ describe('configuration and LLM contract', () => {
       expect((await soft.result()).reply).toBe('What can I help you with?');
       expect(soft.fetchMock).toHaveBeenCalledTimes(2);
       const hard = run([completion(draft('I\'m interested!')), completion(draft('Count me in!'))]);
-      await expect(hard.result()).rejects.toThrow('commitment');
+      const substituted = await hard.result();
+      expect(substituted.reply).toBe('Could you share a few more details?');
       expect(hard.fetchMock).toHaveBeenCalledTimes(2);
     });
     it('recovers once from invalid JSON, then gives up', async () => {

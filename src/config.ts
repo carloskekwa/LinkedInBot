@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 
@@ -40,6 +40,8 @@ const schema = z.object({
   // Logs incoming message text and the AI's answer. Private data: for local debugging only.
   LOG_MESSAGE_TEXT: bool.default(false),
   SYSTEM_PROMPT: z.string().default('./prompts/system.md'),
+  // Private facts the bot may state about the owner (gitignored). Optional.
+  OWNER_FACTS_FILE: z.string().default('./prompts/owner-facts.md'),
   FALLBACK_REPLY: z.string().min(1).max(300).default(
     "Thanks for your message! This is an automated reply, and I can't give you a proper answer right now.",
   ),
@@ -65,5 +67,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return schema.parse(env);
 }
 export function loadPrompt(config: Config): string {
-  return readFileSync(resolve(config.SYSTEM_PROMPT), 'utf8');
+  const base = readFileSync(resolve(config.SYSTEM_PROMPT), 'utf8');
+  const facts = loadOwnerFacts(config.OWNER_FACTS_FILE).facts;
+  if (facts.length === 0) return base;
+  return `${base}\nFACTS ABOUT THE OWNER (approved by the owner; the ONLY personal facts you may state)\n` +
+    'State them plainly in the first person when someone asks, for example "I work at ..." ' +
+    'Use only what is written here and add no detail of your own. Anything about the owner that ' +
+    'is not listed here is unknown: follow the rule for unknown owner information above.\n' +
+    `${facts.map(fact => `- ${fact}`).join('\n')}\n`;
+}
+
+const MAX_FACTS_CHARS = 2_000;
+// Reads the owner's private facts file. Missing file = no facts. Comment lines (#) and lines
+// still containing <placeholders> from the example file are ignored.
+export function loadOwnerFacts(path: string): { facts: string[]; skipped: number } {
+  const file = resolve(path);
+  if (!path || !existsSync(file)) return { facts: [], skipped: 0 };
+  const facts: string[] = [];
+  let skipped = 0;
+  for (const raw of readFileSync(file, 'utf8').split('\n')) {
+    const line = raw.trim().replace(/^[-*]\s+/, '');
+    if (!line || line.startsWith('#')) continue;
+    if (/<[^>\n]+>/.test(line)) { skipped++; continue; }
+    facts.push(line);
+  }
+  if (facts.join('\n').length > MAX_FACTS_CHARS) {
+    throw new Error(`Owner facts file is too long (max ${MAX_FACTS_CHARS} characters); shorten it`);
+  }
+  return { facts, skipped };
 }

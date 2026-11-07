@@ -15,3 +15,5 @@ logs/
 playwright-report/
 test-results/
 .DS_Store
+# Private facts the bot may state about the owner
+prompts/owner-facts.md

@@ -225,15 +225,37 @@ honest about automation: asked sincerely whether it is a bot, it says so briefly
 tone does not require pretending to be human. `LLM_TEMPERATURE` (default 0.8) controls
 wording variety.
 
-**Rewrite check.** Prompts cannot guarantee compliance, so code checks each draft. A
-draft that states interest or a commitment for the owner ("I'd love to…", "I'm
-interested", "count me in") or uses support-bot phrasing triggers **one** rewrite request
-(about one extra second, only when needed). A commitment that survives the rewrite is
-never sent; the fallback is used instead. Style-only issues are tolerated on the second
-try. Invalid JSON also gets one rewrite. Transport failures are not retried.
-These checks are phrase lists and will miss paraphrases; they reduce, not eliminate,
-the risk. It is **not** a complete defense against prompt injection, misinformation or
-multilingual policy violations. Review model quality before unattended use.
+**About you (owner facts).** The bot knows nothing about you unless you tell it. Copy
+[prompts/owner-facts.example.md](prompts/owner-facts.example.md) to
+`prompts/owner-facts.md` (gitignored, never committed) and fill in what you are happy to
+tell any new connection (employer, role, location...). The bot may then answer "where do
+you work?" in the first person using only those lines. Anything not listed is treated as
+unknown and answered with "It's on my profile if you want to take a look." Startup logs
+whether facts were loaded. These lines are sent to the AI provider with every reply and can
+be repeated to the other person, so keep out phone numbers, private emails, addresses and
+salary. Lines still containing `<placeholders>` are ignored.
+
+**Rewrite check.** Prompts cannot guarantee compliance, and in testing a small model
+invented a location, an employer-style claim, "10 years of experience" and "I don't work
+with React Native" when it had no facts. So code checks every draft for: (1) interest,
+availability or commitments made for the owner ("I'd love to…", "I'm interested", "not
+at the moment", "count me in"); (2) first-person claims about the owner (where they are
+based or work, what they do or don't do, years of experience, what their profile says)
+that are not supported by the owner facts (questions are never treated as claims); and
+(3) support-bot phrasing. Any hit triggers **one** rewrite request (about one extra
+second, only when needed). If an unsupported claim or commitment survives the rewrite,
+an English conversation gets a short neutral line ("It's on my profile if you want to
+take a look." / "Could you share a few more details?") and other languages get the
+`FALLBACK_REPLY`. Style-only issues are tolerated on the second try. Invalid JSON also
+gets one rewrite. Transport failures are not retried.
+Measured with the real model on 48 synthetic questions designed to provoke invented
+facts: 0 unsupported claims reached the output after the checks, 0 generic fallbacks,
+about 40% of drafts needed a rewrite. These checks are phrase patterns and will miss
+paraphrases (for example a mild "I'm always curious about new opportunities" still
+passes); they reduce, not eliminate, the risk.
+It is **not** a complete defense against prompt injection, misinformation or
+multilingual policy violations (the claim checks are English-only). Review model quality
+before unattended use.
 On model errors, an explicit automated fallback is sent (`FALLBACK_REPLY`); it does not
 promise that the owner will follow up. Appropriate no-reply decisions prevent loops.
 No fallback is sent when doing so would violate Stop, authentication, action caps
@@ -353,7 +375,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **92 tests in 4 files** passed;
+`npm run typecheck` and `npm run build` passed; all **100 tests in 4 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.
