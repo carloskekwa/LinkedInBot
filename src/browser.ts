@@ -29,6 +29,16 @@ function threadUrl(raw: string): string {
   }
   return `${origin}${url.pathname}`;
 }
+// A card label that clearly means "before today" (weekday, date, "Yesterday"). Anything
+// else, including times of day and unrecognised formats, counts as fresh, so an unknown
+// format can never cause a real new message to be ignored.
+export function looksOld(label: string): boolean {
+  const value = label.trim();
+  return /^(yesterday|mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?$/i.test(value) ||
+    /^[A-Za-z]{3,9}\.?\s+\d{1,2}(,\s*\d{4})?$/.test(value) ||
+    /^\d{1,2}\s+[A-Za-z]{3,9}\.?(\s+\d{4})?$/.test(value) ||
+    /^\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}$/.test(value);
+}
 async function optionalText(locator: Locator): Promise<string> {
   return await locator.count() ? (await locator.first().innerText()).trim() : '';
 }
@@ -47,6 +57,7 @@ export class PlaywrightAdapter implements LinkedInPort {
   private readonly fingerprints = new Map<string, string>();
   private readonly changedAt = new Map<string, number>();
   private readonly cardRetryAt = new Map<string, number>();
+  private readonly staleLate = new Set<string>();
   // Alternative URL forms of the owner's own profile link, learned from one-to-one threads.
   private readonly ownerAliases = new Set<string>();
   constructor(
@@ -254,9 +265,9 @@ export class PlaywrightAdapter implements LinkedInPort {
       if (!names) continue;
       const key = hash(names);
       if ((this.cardRetryAt.get(key) ?? 0) > now) continue;
+      const timeLabel = await optionalText(item.locator(this.selectors.conversationTime));
       const fingerprint = hash(JSON.stringify([names,
-        await optionalText(item.locator(this.selectors.conversationSnippet)),
-        await optionalText(item.locator(this.selectors.conversationTime))]));
+        await optionalText(item.locator(this.selectors.conversationSnippet)), timeLabel]));
       let id = this.knownThreads.get(key);
       if (!id) {
         try {
@@ -272,6 +283,8 @@ export class PlaywrightAdapter implements LinkedInPort {
         }
         this.openThread = id;
         this.knownThreads.set(key, id);
+        // LinkedIn renders cards lazily, so an old thread can surface after startup.
+        if (!firstScan && looksOld(timeLabel)) this.staleLate.add(id);
       }
       const previous = this.fingerprints.get(key);
       if (previous !== fingerprint) {
@@ -285,6 +298,7 @@ export class PlaywrightAdapter implements LinkedInPort {
     }
     return [...reported];
   }
+  staleConversations(): ReadonlySet<string> { return this.staleLate; }
   private async lastEventUrn(): Promise<string | null> {
     const events = this.messagesPage.locator(this.selectors.message);
     const count = await events.count();

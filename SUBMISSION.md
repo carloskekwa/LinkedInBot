@@ -30,6 +30,6 @@ groups, InMail and unidentified threads are skipped. Rendered history/conversati
 lists are bounded and UI-dependent. Manual re-login is required for checkpoints.
 Exactly-once delivery and 24-hour uninterrupted operation are not guaranteed.
 LinkedIn restricts this type of automation and may restrict the account.
-All 79 offline tests, the build and runtime/test type checks passed.
+All 82 offline tests, the build and runtime/test type checks passed.
 Source: https://github.com/carloskekwa/LinkedInBot.
 No live performance figures are claimed here.

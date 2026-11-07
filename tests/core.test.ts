@@ -70,6 +70,15 @@ describe('action orchestration', () => {
     s.advance(130_000); await s.bot.messageTick();
     expect(s.fake.threadReads.get('bad')).toBe(reads + 1);
   });
+  it('baselines old threads that surface after startup but replies to fresh new ones', async () => {
+    const s = setup({ INITIAL_HISTORY: 'baseline' });
+    await s.bot.messageTick();
+    s.fake.threads.set('old-late', { id: 'old-late', supported: true, messages: [syntheticMessage('o1')] });
+    s.fake.threads.set('fresh-late', { id: 'fresh-late', supported: true, messages: [syntheticMessage('f1')] });
+    s.fake.stale.add('old-late');
+    await s.bot.messageTick(); s.advance(); await s.bot.messageTick();
+    expect(s.fake.sent.map(m => m.id)).toEqual(['fresh-late']);
+  });
   it('escalates a LinkedIn HTTP rejection instead of walking every remaining thread', async () => {
     const s = setup();
     s.fake.threads.set('later', { id: 'later', supported: true, messages: [syntheticMessage('x1')] });

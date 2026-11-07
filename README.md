@@ -102,6 +102,17 @@ threads. This prevents unsolicited replies to an old inbox. Start before the eva
 sends messages. `reply-latest` explicitly opts into handling the latest inbound batch
 in existing threads. Messages preceding an owner's reply are always consumed.
 
+LinkedIn renders conversation cards lazily, so an old thread can surface after
+startup. A card first seen after startup whose activity label clearly means "before
+today" (a weekday, a date, "Yesterday") is baselined instead of answered. The check
+fails open: a time of day or any unrecognised label is treated as fresh, so a real new
+message is never ignored because of an unexpected label format.
+
+Replies: the system prompt asks the model to reply to every message from a person
+(including greetings, thanks, emoji-only and empty messages) and to decline only on an
+explicit request to stop or an obvious automated notification. Run with
+`LOG_LEVEL=debug` to see the model's decision and reason (this may echo message text).
+
 ## Keeping it running
 
 Plug the machine in, keep networking available and keep the desktop logged in.
@@ -311,7 +322,7 @@ after collecting a real soak dataset, along with sample counts and missing recei
 ## Validation
 
 Verified on macOS with Node 20.20.1:
-`npm run typecheck` and `npm run build` passed; all **79 tests in 4 files** passed;
+`npm run typecheck` and `npm run build` passed; all **82 tests in 4 files** passed;
 `npm audit` reported **0 vulnerabilities**. The synthetic demo confirmed one fake
 invitation and one fake reply without duplicate processing. These are offline
 results, not a live LinkedIn soak test or real latency benchmark.

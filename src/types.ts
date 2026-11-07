@@ -32,6 +32,8 @@ export interface LinkedInPort {
   send(id: string, text: string, beforeClick: () => void): Promise<void>;
   verifySend(id: string, textHash: string, afterMessageId: string): Promise<Verification>;
   close(): Promise<void>;
+  // Threads first seen after startup whose latest activity is clearly old (not today).
+  staleConversations?(): ReadonlySet<string>;
 }
 export interface Reply {
   should_reply: boolean;

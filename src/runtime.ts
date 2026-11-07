@@ -121,10 +121,13 @@ export class Bot {
     // A manual owner reply also handles preceding inbound messages.
     const lastOwn = thread.messages.findLastIndex(m => m.own);
     if (lastOwn >= 0) this.store.consume(thread.messages.slice(0, lastOwn + 1).map(m => m.id));
+    const known = this.initialThreads?.has(thread.id) === true;
+    const stale = this.port.staleConversations?.().has(thread.id) === true;
     if (this.store.initializeConversation(thread.id) && this.config.INITIAL_HISTORY === 'baseline' &&
-        this.initialThreads?.has(thread.id)) {
+        (known || stale)) {
       this.store.consume(thread.messages.map(m => m.id));
-      this.log.info({ ref: hash(thread.id) }, 'Initial history baselined without replying');
+      this.log.info({ ref: hash(thread.id), reason: known ? 'present at startup' : 'old activity surfaced late' },
+        'Initial history baselined without replying');
     }
   }
   async messageTick(): Promise<void> {
@@ -178,6 +181,9 @@ export class Bot {
       reply = { should_reply: true, reply: this.config.FALLBACK_REPLY, language: 'unknown', reason: 'fallback' };
     }
     const llmMs = Math.round(performance.now() - start);
+    // Debug only: the model's free-text reason may echo message content.
+    this.log.debug({ ref: hash(id), shouldReply: reply.should_reply, language: reply.language,
+      reason: reply.reason, llmMs }, 'Model decision');
     const generatedAt = this.now();
     this.checkStop();
     const fresh = await this.port.thread(id);

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { chromium, type Browser } from 'playwright';
 import { pino } from 'pino';
-import { PlaywrightAdapter, profileUrl } from '../src/browser.js';
+import { PlaywrightAdapter, looksOld, profileUrl } from '../src/browser.js';
 import { loadConfig } from '../src/config.js';
 import { hash } from '../src/time.js';
 
@@ -174,6 +174,41 @@ describe('live adapter against synthetic DOM (not live LinkedIn)', { timeout: 20
   it('restricts profile navigation to LinkedIn profile paths', () => {
     expect(profileUrl('/in/synthetic/?tracking=1')).toBe('https://www.linkedin.com/in/synthetic/');
     expect(() => profileUrl('https://example.invalid/in/synthetic/')).toThrow();
+  });
+  it('flags cards with clearly old activity that surface after startup, and fails open otherwise', async () => {
+    const { port, messages } = await adapter();
+    try {
+      await messages.goto('https://www.linkedin.com/messaging/thread/synthetic-1/');
+      await port.conversations();
+      expect(port.staleConversations().size).toBe(0);
+      await messages.evaluate(() => {
+        const list = document.querySelector('ul.msg-conversations-container__conversations-list')!;
+        const add = (n: number, name: string, label: string) => {
+          const li = document.createElement('li');
+          li.className = 'msg-conversation-listitem';
+          li.innerHTML = '<div class="msg-conversation-listitem__link" onclick="openFixtureThread(' + n + ')">' +
+            '<h3 class="msg-conversation-listitem__participant-names">' + name + '</h3>' +
+            '<p class="msg-conversation-card__message-snippet">Hi</p>' +
+            '<time class="msg-conversation-card__time-stamp">' + label + '</time></div>';
+          list.append(li);
+        };
+        add(3, 'Old late contact', 'Nov 3');
+        add(4, 'Fresh late contact', '6:31 PM');
+        add(5, 'Unknown format contact', 'Just now');
+      });
+      const reported = await port.conversations();
+      const base = 'https://www.linkedin.com/messaging/thread/synthetic-';
+      expect(reported.sort()).toEqual([base + '3/', base + '4/', base + '5/']);
+      expect([...port.staleConversations()]).toEqual([base + '3/']);
+    } finally { await port.close(); }
+  });
+  it('classifies card activity labels as old only when clearly before today', () => {
+    for (const old of ['Nov 3', 'Nov 3, 2025', '3 Nov', 'Yesterday', 'Fri', 'Saturday', '11/03/2025', '03.11.2025']) {
+      expect(looksOld(old), old).toBe(true);
+    }
+    for (const fresh of ['6:31 PM', '18:31', '10:00 AM', 'Just now', 'Now', '5m', '', 'Today']) {
+      expect(looksOld(fresh), fresh).toBe(false);
+    }
   });
   it('accepts only person connection requests, not Page or newsletter invitations', async () => {
     const { port } = await adapter();
